@@ -2,3 +2,11 @@
 *.json
 *.csv
 test/
+tmp/
+input/
+*.pyc
+.vscode
+*.pyo
+*.pyd
+__pycache__
+*/__pycache__
