@@ -13,8 +13,13 @@ import csv
 import os
 import json
 import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 from common.app_config import load_app_config
-from trace_index import (
+from cpg_utils.trace_index import (
     build_nodes_index,
     build_trace_index_records,
     load_ast_edges,
@@ -430,8 +435,7 @@ def pick_call_edge(a_id, a_type, dst_type, dst_candidates, nodes_meta, children_
 
 def main():
     """CLI entrypoint: build `trace_debug.json` and infer supplemental `CALLS` edges."""
-    cfg = load_app_config(argv=sys.argv[1:])
-    base = cfg.base_dir
+    cfg = load_app_config(config_path=os.path.join(_ROOT, 'config.json'), argv=sys.argv[1:], base_dir=_ROOT)
     trace_path = cfg.find_input_file('trace.log')
     nodes_path = cfg.find_input_file('nodes.csv')
     edges_path = cfg.find_input_file('cpg_edges.csv')

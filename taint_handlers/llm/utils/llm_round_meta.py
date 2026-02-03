@@ -140,13 +140,6 @@ def _add_llm_returned_seqs_to_set(parsed: dict, llm_seqs: set) -> None:
             llm_seqs.add(int(s))
         except Exception:
             pass
-    for rt in parsed.get('taints') or []:
-        if not isinstance(rt, dict):
-            continue
-        try:
-            llm_seqs.add(int(rt.get('seq')))
-        except Exception:
-            pass
 
 
 def _log_llm_variants(meta_debug: dict, parsed: dict, ctx: dict, this_obj: str) -> None:

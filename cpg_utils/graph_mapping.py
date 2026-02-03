@@ -765,19 +765,28 @@ def ensure_trace_edges_csv(base: str) -> bool:
     if os.path.exists(p):
         _TRACE_EDGES_READY_BASES.add(base_norm)
         return True
-    script_path = os.path.join(base_norm, 'trace_edges.py')
-    if not os.path.exists(script_path):
+    script_candidates = [
+        os.path.join(base_norm, 'trace_utils', 'trace_edges.py'),
+        os.path.join(base_norm, 'trace_edges.py'),
+        os.path.join(base_norm, 'cpg_utils', 'trace_call_edges.py'),
+    ]
+    script_paths = [sp for sp in script_candidates if os.path.exists(sp)]
+    if not script_paths:
         return False
-    try:
-        subprocess.run(
-            [sys.executable, script_path],
-            cwd=base_norm,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        return False
+    for script_path in script_paths:
+        try:
+            subprocess.run(
+                [sys.executable, script_path],
+                cwd=base_norm,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            continue
+        if os.path.exists(p):
+            _TRACE_EDGES_READY_BASES.add(base_norm)
+            return True
     if os.path.exists(p):
         _TRACE_EDGES_READY_BASES.add(base_norm)
         return True

@@ -11,10 +11,55 @@ import sys
 from typing import Any
 
 
-DEFAULT_SYMBOLIC_BASE_PROMPT = (
-    "你是一个符号执行助手。给定下方代码上下文（按 trace seq 标号的源码行），"
-    "请进行路径条件推导与约束传播，输出你认为关键的路径条件与变量约束。"
-)
+DEFAULT_TEST_COMMAND_PATH = os.path.join("input", "测试命令.txt")
+
+
+def _read_text(path: str) -> str:
+    if not isinstance(path, str) or not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _extract_test_command_fields(test_command_text: str) -> tuple[list[str], dict[str, str]]:
+    env_lines: list[str] = []
+    cookie_value = ""
+    get_value = ""
+    post_value = ""
+    seed_value = ""
+    if not isinstance(test_command_text, str) or not test_command_text.strip():
+        return env_lines, {"COOKIE": cookie_value, "GET": get_value, "POST": post_value, "SEED": seed_value}
+
+    for raw in (test_command_text.splitlines() or []):
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if line.startswith("export "):
+            rest = (line[len("export ") :] or "").strip()
+            if rest:
+                env_lines.append(rest)
+            continue
+        if line.startswith("COOKIE:"):
+            cookie_value = (line.split("COOKIE:", 1)[1] or "").strip()
+            continue
+        if line.startswith("GET:"):
+            get_value = (line.split("GET:", 1)[1] or "").strip()
+            continue
+        if line.startswith("POST:"):
+            post_value = (line.split("POST:", 1)[1] or "").strip()
+            continue
+        if line.startswith("seed:"):
+            seed_value = (line.split("seed:", 1)[1] or "").strip()
+            continue
+        if "seed:" in line:
+            after = line.split("seed:", 1)[1]
+            seed_value = (after or "").strip()
+            continue
+
+    return env_lines, {"COOKIE": cookie_value, "GET": get_value, "POST": post_value, "SEED": seed_value}
 
 
 def _import_prompt_utils():
@@ -452,10 +497,6 @@ def generate_symbolic_execution_prompt(
         windows_root=windows_root,
     )
 
-    bp = (base_prompt if base_prompt is not None else DEFAULT_SYMBOLIC_BASE_PROMPT).strip()
-    lines = [bp] if bp else []
-    lines.append("")
-
     infer_if_directions_for_seqs, load_trace_index_records = _import_if_branch_utils()
     infer_switch_choices_for_seqs, build_seq_to_case_label, build_switch_case_result_set_for_seq, insert_mapped_items_after_seq = _import_switch_branch_utils()
     load_nodes, load_ast_edges = _import_graph_mapping()
@@ -534,11 +575,53 @@ def generate_symbolic_execution_prompt(
             )
             mapped = insert_mapped_items_after_seq(mapped or [], after_seq=int(input_seq_i), insert_items=mapped_cases or [])
 
+    test_command_path = _resolve_existing_path(
+        os.path.join(os.getcwd(), DEFAULT_TEST_COMMAND_PATH),
+        fallback=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), DEFAULT_TEST_COMMAND_PATH),
+    )
+    test_command_text = _read_text(test_command_path)
+    env_lines, req_fields = _extract_test_command_fields(test_command_text)
+    env_block = "\n".join(env_lines).strip()
+    cookie_block = ((req_fields.get("COOKIE") or "").strip() if isinstance(req_fields, dict) else "")
+    get_block = ((req_fields.get("GET") or "").strip() if isinstance(req_fields, dict) else "")
+    post_block = ((req_fields.get("POST") or "").strip() if isinstance(req_fields, dict) else "")
+    seed_block = ((req_fields.get("SEED") or "").strip() if isinstance(req_fields, dict) else "")
+
+    seq_display = ""
+    if input_seq_i is not None:
+        seq_display = str(int(input_seq_i))
+    else:
+        seq_display = "?"
+
+    lines: list[str] = []
+    lines.append(
+        "请你根据代码上下文，严格按照符号执行的一般流程，将"
+        + seq_display
+        + "行的if语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够让代码走向if语句另一个方向的外部输入。"
+    )
+    lines.append("")
+    lines.append("本次执行的环境变量是：")
+    if env_block:
+        lines.append(env_block)
+    lines.append("")
+    lines.append("本次执行的输入是：")
+    lines.append("COOKIE:" + cookie_block)
+    lines.append("GET:" + get_block)
+    lines.append("POST:" + post_block)
+    if seed_block and (not cookie_block and not get_block and not post_block):
+        lines.append("SEED:")
+        lines.append(seed_block)
+    lines.append("")
     lines.append("代码上下文（每行：seq | path:line | code）：")
     for it in mapped or []:
         if not isinstance(it, dict):
             continue
         seq = it.get("seq")
+        seq_i = None
+        try:
+            seq_i = int(seq) if seq is not None else None
+        except Exception:
+            seq_i = None
         path = (it.get("path") or "").strip()
         ln = it.get("line")
         try:
@@ -551,23 +634,38 @@ def generate_symbolic_execution_prompt(
         if not code_s.strip():
             code_s = "<SOURCE_NOT_FOUND>"
         seq_s = str(seq) if seq is not None else "?"
-        branch_s = ""
-        try:
-            seq_i = int(seq) if seq is not None else None
-        except Exception:
-            seq_i = None
+        branch_tag = ""
         if seq_i is not None:
-            b = seq_to_branch.get(int(seq_i))
-            if b:
-                branch_s = f"branch={b} | "
-            sc = seq_to_switch_case.get(int(seq_i))
-            if sc:
-                branch_s = f"{branch_s}case={sc} | "
-        impl_s = ""
-        tags = loc_to_impl_tags.get(loc) if loc_to_impl_tags else None
-        if tags:
-            impl_s = f" (FUNC_IMPL: {', '.join(tags)})"
-        lines.append(f"{seq_s} | {loc} | {branch_s}{code_s}{impl_s}")
+            branch_tag = (seq_to_branch.get(int(seq_i)) or "").strip()
+        if branch_tag and code_s.lstrip().startswith("if"):
+            code_s = f"[{branch_tag}] {code_s}"
+        lines.append(f"{seq_s} | {loc} | {code_s}")
+    lines.append("")
+    lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
+    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE或GET参数。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分，不需要修改的部分请尽可能保持原样。")
+    lines.append("仅基于给出的代码和 if 语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
+    lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
+    lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
+    lines.append("请输出一个JSON文件，示例：")
+    lines.append("{")
+    lines.append('  "solutions": [')
+    lines.append("    {")
+    lines.append('      "POST": {')
+    lines.append('        "username": "new_admin",')
+    lines.append('        "status": "active"')
+    lines.append("      },")
+    lines.append('      "COOKIE": {')
+    lines.append('        "session_id": "updated_session_12345",')
+    lines.append('        "user_token": "new_token_abc"')
+    lines.append("      }")
+    lines.append("    },")
+    lines.append("    {")
+    lines.append('      "ENV": {')
+    lines.append('        "METHOD": "GET"')
+    lines.append("      }")
+    lines.append("    }")
+    lines.append("  ]")
+    lines.append("}")
     return "\n".join(lines).rstrip() + "\n"
 
 

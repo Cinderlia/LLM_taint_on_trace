@@ -33,6 +33,20 @@ def _ensure_llm_offline_and_client(ctx: dict, get_default_client):
 
     client = ctx.get('llm_client')
     if client is None:
+        if ctx.get('llm_offline'):
+            client = None
+            ctx['llm_client'] = None
+            lg = ctx.get('logger') if isinstance(ctx, dict) else None
+            if lg is not None:
+                try:
+                    lg.info(
+                        'llm_client_init_state',
+                        llm_offline=bool(ctx.get('llm_offline')),
+                        llm_client_type=None,
+                    )
+                except Exception:
+                    pass
+            return None
         lg = ctx.get('logger') if isinstance(ctx, dict) else None
         try:
             client = get_default_client()

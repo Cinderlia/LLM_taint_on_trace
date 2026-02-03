@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Iterable
+from collections.abc import Iterable
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -15,8 +15,8 @@ BASE_PROMPT = """你是一个精通代码分析和漏洞挖掘的安全专家，
 明确规则：
 1. 【必须选】如果分支语句中的变量可能直接或间接来源于用户输入（GET、POST、COOKIE、HTTP头部等）
 2. 【必须选】如果分支语句中的变量可能来源于环境变量（如getenv）
-3. 【不要选】如果变量明确来源于本地文件、硬编码配置、SESSION存储
-4. 【不要选】如果变量直接来源于数据库连接（不包括查询结果数据）
+3. 【不要选】如果变量大概率来源于本地文件、硬编码配置、SESSION存储
+4. 【不要选】如果变量很可能来源于数据库连接（不包括查询结果数据）
 5. 【不要选】如果是系统环境检查（PHP版本、SQL版本、系统版本等）
 6. 【不要选】如果是本地文件存在性检查
 7. 【不要选】如果是数据库连接测试或组件功能验证
@@ -33,10 +33,13 @@ BASE_PROMPT = """你是一个精通代码分析和漏洞挖掘的安全专家，
 不要输出任何其他内容。"""
 
 
-def build_prompt(*, sections: Iterable[dict], separator: str, logger: Logger | None = None) -> str:
+def build_prompt(*, sections: Iterable[dict], separator: str, base_prompt: str | None = None, logger: Logger | None = None) -> str:
     chunks = []
     count = 0
-    chunks.append(BASE_PROMPT.strip())
+    prompt_text = (base_prompt or "").strip()
+    if not prompt_text:
+        prompt_text = BASE_PROMPT.strip()
+    chunks.append(prompt_text)
     for sec in sections or []:
         seq = sec.get("seq")
         code = sec.get("code") or ""
@@ -51,17 +54,49 @@ def build_prompt(*, sections: Iterable[dict], separator: str, logger: Logger | N
     return out
 
 
-def format_section(seq: int, lines: list[dict], logger: Logger | None = None) -> dict:
+def format_section(seq: int, lines: list[dict], mark_seqs: Iterable[int] | None = None, logger: Logger | None = None) -> dict:
     code_lines = []
-    if_line_written = False
+    mark_set = set()
+    try:
+        mark_set.add(int(seq))
+    except Exception:
+        pass
+    for ms in mark_seqs or []:
+        try:
+            mark_set.add(int(ms))
+        except Exception:
+            continue
+    grouped_keys = []
+    best_by_key = {}
     for it in lines or []:
+        if not isinstance(it, dict):
+            continue
+        p = it.get("path")
+        ln = it.get("line")
+        if p and ln is not None:
+            key = (str(p), int(ln))
+        else:
+            key = ("__code__", (it.get("code") or "").strip())
+        if key not in best_by_key:
+            best_by_key[key] = it
+            grouped_keys.append(key)
+            continue
+        try:
+            si = int(it.get("seq")) if it.get("seq") is not None else None
+        except Exception:
+            si = None
+        if si is not None and (int(si) == int(seq) or int(si) in mark_set):
+            best_by_key[key] = it
+    for key in grouped_keys:
+        it = best_by_key.get(key)
+        if not isinstance(it, dict):
+            continue
         s = it.get("seq")
         code = (it.get("code") or "").strip()
         if s is None:
             continue
-        if not if_line_written and int(s) == int(seq):
+        if int(s) in mark_set:
             code_lines.append(f"{int(s)} {code}".rstrip())
-            if_line_written = True
         else:
             code_lines.append(f"{code}".rstrip())
     out = {"seq": int(seq), "code": "\n".join(code_lines)}

@@ -27,6 +27,7 @@ from taint_handlers import REGISTRY
 from taint_handlers.llm.core.llm_process import process_taints_llm
 from trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 from llm_utils.prompts.symbolic_prompt import generate_symbolic_execution_prompt
+from llm_utils.symbolic_runner import build_symbolic_response_example, run_symbolic_prompt, write_symbolic_prompt, write_symbolic_response
 
 def _safe_rmtree(p: str) -> None:
     """Best-effort recursive delete for a directory path."""
@@ -50,6 +51,7 @@ def clean_previous_test_outputs(test_dir: str, seq: int | None = None) -> None:
         pass
     _safe_rmtree(os.path.join(test_dir, 'logs'))
     _safe_rmtree(os.path.join(test_dir, 'rounds'))
+    _safe_rmtree(os.path.join(test_dir, 'symbolic'))
     if isinstance(test_dir, str) and test_dir:
         try:
             os.makedirs(os.path.join(test_dir, 'llm'), exist_ok=True)
@@ -911,7 +913,7 @@ def parse_cli_args(argv: list[str]) -> dict:
     args = list(argv or [])
     args = [x.replace('--llm--', '--llm-') if isinstance(x, str) and x.startswith('--llm--') else x for x in args]
     debug_mode = any(x == '--debug' for x in args)
-    llm_mode = any(x == '--llm' for x in args) or any(x == '--llm-test' for x in args)
+    llm_mode = any(x == '--llm' for x in args)
     llm_test_mode = any(x == '--llm-test' for x in args)
     prompt_mode = any(x == '--prompt' for x in args)
 
@@ -936,6 +938,19 @@ def parse_cli_args(argv: list[str]) -> dict:
         'prompt_mode': bool(prompt_mode),
     }
 
+def _parse_analyze_flags_from_config(cfg_raw: dict) -> dict:
+    if not isinstance(cfg_raw, dict):
+        return {'test': False, 'debug': False, 'prompt': False}
+    sec = cfg_raw.get('analyze_if')
+    if not isinstance(sec, dict):
+        sec = cfg_raw.get('analyze_if_line')
+    if not isinstance(sec, dict):
+        sec = {}
+    test_mode = bool(sec.get('test'))
+    debug_mode = bool(sec.get('debug'))
+    prompt_mode = bool(sec.get('prompt'))
+    return {'test': test_mode, 'debug': debug_mode, 'prompt': prompt_mode}
+
 def main():
     """CLI entrypoint: `python analyze_if_line.py <seq> [--debug] [--llm|--llm-test] [--llm-max=N]`."""
     if len(sys.argv) < 2:
@@ -943,9 +958,11 @@ def main():
     s = sys.argv[1]
     cfg = load_app_config(argv=sys.argv[2:])
     opts = parse_cli_args(sys.argv[2:])
-    debug_mode = bool(opts.get('debug_mode'))
-    llm_mode = bool(opts.get('llm_mode'))
-    llm_test_mode = bool(opts.get('llm_test_mode'))
+    cfg_flags = _parse_analyze_flags_from_config(cfg.raw if hasattr(cfg, 'raw') else {})
+    debug_mode = bool(opts.get('debug_mode') or cfg_flags.get('debug'))
+    prompt_mode = bool(opts.get('prompt_mode') or cfg_flags.get('prompt'))
+    test_mode = bool(opts.get('llm_test_mode') or cfg_flags.get('test'))
+    llm_enabled = bool(opts.get('llm_mode') or test_mode)
     llm_max_calls = opts.get('llm_max_calls')
     try:
         n = int(s)
@@ -956,7 +973,7 @@ def main():
     os.makedirs(test_root, exist_ok=True)
     run_dir = os.path.join(test_root, f"seq_{int(n)}")
     clean_previous_test_outputs(run_dir, n)
-    clean_llm_io_dirs(run_dir, llm_mode=llm_mode, llm_test_mode=llm_test_mode)
+    clean_llm_io_dirs(run_dir, llm_mode=llm_enabled, llm_test_mode=test_mode)
     logger = Logger(base_dir=run_dir, min_level=('DEBUG' if debug_mode else 'INFO'), name=f'analyze_if_line:{n}', also_console=True)
     out_path = os.path.join(run_dir, f"analysis_output_{n}.json")
     def finish(obj):
@@ -1015,9 +1032,9 @@ def main():
         'rels_path': rels_path,
         'scope_root': '/app',
         'windows_root': r'D:\files\witcher\app',
-        'llm_enabled': llm_mode,
-        'llm_max_calls': (llm_max_calls if llm_mode else None),
-        'llm_offline': (True if llm_test_mode else False) if llm_mode else None,
+        'llm_enabled': llm_enabled,
+        'llm_max_calls': (llm_max_calls if llm_enabled else None),
+        'llm_offline': (True if test_mode else False) if llm_enabled else None,
         'llm_scope_debug': bool(debug_mode),
         'debug': {},
         'logger': logger,
@@ -1038,7 +1055,7 @@ def main():
     except Exception:
         logger.exception('analyze_failed')
         try:
-            if llm_mode:
+            if llm_enabled:
                 rs2 = sort_dedup_result_set_by_seq(build_result_set_from_llm_seqs(ctx))
             else:
                 rs = ctx.get('result_set') or []
@@ -1048,7 +1065,7 @@ def main():
             rs2 = []
         finish({'input_seq': n, 'initial_taints': initial, 'result_set': rs2, 'error': 'analyze_failed'})
         raise SystemExit(1)
-    if llm_mode:
+    if llm_enabled:
         rs2 = sort_dedup_result_set_by_seq(build_result_set_from_llm_seqs(ctx))
     else:
         rs = ctx.get('result_set') or []
@@ -1063,24 +1080,40 @@ def main():
         logger.write_json('logs', 'debug_ctx.json', {'ast_method_call': (ctx.get('debug') or {}).get('ast_method_call')})
     except Exception:
         pass
-    prompt_path = os.path.join(run_dir, f"symbolic_prompt_{n}.txt")
-    try:
-        prompt_text = generate_symbolic_execution_prompt(
-            rs2,
-            input_seq=n,
-            input_path=ctx.get('path'),
-            input_line=ctx.get('line'),
-            scope_root=ctx.get('scope_root') or '/app',
-            trace_index_path=trace_index_path,
-            windows_root=ctx.get('windows_root') or r'D:\files\witcher\app',
-            base_prompt=None,
-        )
-        with open(prompt_path, 'w', encoding='utf-8') as f:
-            f.write(prompt_text)
-        out['symbolic_prompt_path'] = prompt_path
-        logger.info('write_symbolic_prompt', prompt_path=prompt_path)
-    except Exception:
-        logger.exception('write_symbolic_prompt_failed', prompt_path=prompt_path)
+    if prompt_mode:
+        try:
+            prompt_text = generate_symbolic_execution_prompt(
+                rs2,
+                input_seq=n,
+                input_path=ctx.get('path'),
+                input_line=ctx.get('line'),
+                scope_root=ctx.get('scope_root') or '/app',
+                trace_index_path=trace_index_path,
+                windows_root=ctx.get('windows_root') or r'D:\files\witcher\app',
+                base_prompt=None,
+            )
+            if bool(opts.get('llm_mode')) and not test_mode:
+                rr = run_symbolic_prompt(
+                    prompt_text,
+                    run_dir=run_dir,
+                    seq=int(n),
+                    llm_offline=False,
+                    logger=logger,
+                )
+                out['symbolic_prompt_path'] = rr.get('prompt_path')
+                out['symbolic_response_path'] = rr.get('response_path')
+                out['symbolic_response_json_path'] = rr.get('response_json_path')
+                logger.info('write_symbolic_prompt', prompt_path=out.get('symbolic_prompt_path'), llm_mode=True, test_mode=False)
+            else:
+                prompt_path = write_symbolic_prompt(prompt_text, run_dir=run_dir, seq=int(n))
+                out['symbolic_prompt_path'] = prompt_path
+                if test_mode:
+                    raw_path, json_path = write_symbolic_response(build_symbolic_response_example(), run_dir=run_dir, seq=int(n))
+                    out['symbolic_response_path'] = raw_path
+                    out['symbolic_response_json_path'] = json_path
+                logger.info('write_symbolic_prompt', prompt_path=prompt_path, llm_mode=False, test_mode=bool(test_mode))
+        except Exception:
+            logger.exception('write_symbolic_prompt_failed')
     return finish(out)
 
 if __name__ == '__main__':

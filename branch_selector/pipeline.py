@@ -17,6 +17,7 @@ from llm_utils.taint.taint_llm_calls import LLMCallFailure, chat_text_with_retri
 
 from branch_selector.core.buffer import PromptBuffer
 from branch_selector.core.config import load_config
+from branch_selector.core.scope_folding import ScopeSubsetFolder
 from branch_selector.prompt.llm_response import parse_llm_response
 from branch_selector.prompt.prompt_builder import build_prompt, format_section
 from branch_selector.trace.if_scope_expand import expand_if_seq_groups
@@ -29,6 +30,8 @@ from branch_selector.trace.trace_extract import (
     load_nodes_and_edges,
 )
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
+from if_branch_coverage import check_if_branch_coverage
+from cpg_utils.graph_mapping import safe_int
 
 
 def _safe_rmtree(p: str) -> None:
@@ -46,6 +49,10 @@ def _clear_branch_selector_logs(base_dir: str) -> None:
     _safe_rmtree(os.path.join(base_dir, "branch_selector", "logs"))
 
 
+def _clear_branch_selector_dir(base_dir: str) -> None:
+    _safe_rmtree(os.path.join(base_dir, "branch_selector"))
+
+
 def _clear_seq_dirs(base_dir: str) -> None:
     if not os.path.isdir(base_dir):
         return
@@ -56,6 +63,31 @@ def _clear_seq_dirs(base_dir: str) -> None:
         if not os.path.isdir(seq_dir):
             continue
         _safe_rmtree(seq_dir)
+
+
+def _collect_if_ids_in_record(record: dict, nodes: dict, parent_of: dict[int, int]) -> list[int]:
+    if not isinstance(record, dict):
+        return []
+    out: set[int] = set()
+    for nid in record.get("node_ids") or []:
+        ni = safe_int(nid)
+        if ni is None:
+            continue
+        tt = ((nodes.get(int(ni)) or {}).get("type") or "").strip()
+        if tt == "AST_IF":
+            out.add(int(ni))
+            continue
+        if tt == "AST_IF_ELEM":
+            cur = parent_of.get(int(ni))
+            steps = 0
+            while cur is not None and steps < 8:
+                ct = ((nodes.get(int(cur)) or {}).get("type") or "").strip()
+                if ct == "AST_IF":
+                    out.add(int(cur))
+                    break
+                cur = parent_of.get(int(cur))
+                steps += 1
+    return sorted(out)
 
 
 def _iter_if_switch_sections(
@@ -90,6 +122,31 @@ def _iter_if_switch_sections(
     if logger is not None:
         logger.info("section_iter_start", seqs=len(seq_groups))
     for seq in sorted(seq_groups.keys()):
+        rec = None
+        idx = seq_to_index.get(int(seq))
+        if idx is not None and 0 <= idx < len(trace_index_records):
+            rec = trace_index_records[idx]
+        if rec is None:
+            for r in trace_index_records or []:
+                if int(seq) in (r.get("seqs") or []):
+                    rec = r
+                    break
+        if isinstance(rec, dict):
+            if_ids = _collect_if_ids_in_record(rec, nodes, parent_of)
+            if if_ids:
+                if logger is not None:
+                    logger.info("if_coverage_check_start", seq=int(seq), if_ids=[int(x) for x in if_ids])
+                all_covered = True
+                for if_id in if_ids:
+                    covered = check_if_branch_coverage(int(if_id))
+                    if logger is not None:
+                        logger.info("if_coverage_check_item", seq=int(seq), if_id=int(if_id), covered=bool(covered))
+                    if not covered:
+                        all_covered = False
+                if all_covered:
+                    if logger is not None:
+                        logger.info("if_coverage_skip", seq=int(seq), if_ids=[int(x) for x in if_ids])
+                    continue
         rel_seqs = seq_groups.get(seq) or []
         locs = []
         for s in rel_seqs or []:
@@ -97,8 +154,23 @@ def _iter_if_switch_sections(
             if loc:
                 locs.append(loc)
         lines = map_result_set_to_source_lines(scope_root, locs, trace_index_path=trace_index_path, windows_root=windows_root)
-        section = format_section(int(seq), lines, logger=logger)
-        yield {"seq": int(seq), "section": section}
+        sig_items = []
+        sig_set = set()
+        for it in lines or []:
+            if not isinstance(it, dict):
+                continue
+            p = it.get("path")
+            ln = it.get("line")
+            if not p or ln is None:
+                continue
+            key = f"{p}:{int(ln)}"
+            if key in sig_set:
+                continue
+            sig_set.add(key)
+            sig_items.append(key)
+        sig_items.sort()
+        sig = tuple(sig_items) if sig_items else None
+        yield {"seq": int(seq), "lines": lines, "sig": sig, "scope_seqs": list(rel_seqs or [])}
 
 
 async def _run_analyze_seq(seq: int, *, sem: asyncio.Semaphore, llm_test_mode: bool, logger: Logger | None = None):
@@ -141,6 +213,7 @@ async def _flush_buffer(
     separator: str,
     test_mode: bool,
     analyze_llm_test_mode: bool,
+    base_prompt: str,
     prompt_out_dir: str,
     response_out_dir: str,
     llm_client,
@@ -148,7 +221,7 @@ async def _flush_buffer(
     analyze_sem: asyncio.Semaphore,
     logger: Logger | None = None,
 ):
-    prompt_text = build_prompt(sections=sections, separator=separator, logger=logger)
+    prompt_text = build_prompt(sections=sections, separator=separator, base_prompt=base_prompt, logger=logger)
     if logger is not None:
         logger.info("buffer_flush_start", prompt_index=llm_call_index, sections=len(sections))
     ppath = write_prompt_text(prompt_out_dir, f"prompt_{llm_call_index}.txt", prompt_text, logger=logger)
@@ -209,7 +282,7 @@ async def run_pipeline(config_path: str | None = None):
     base = app_cfg.base_dir
     test_root = app_cfg.test_dir
     tmp_root = app_cfg.tmp_dir
-    _clear_branch_selector_logs(test_root)
+    _clear_branch_selector_dir(test_root)
     if cfg.test_mode:
         _clear_seq_dirs(test_root)
 
@@ -274,9 +347,15 @@ async def run_pipeline(config_path: str | None = None):
         buffer_sections: list[dict] = []
         buffer = PromptBuffer(token_limit=cfg.buffer_token_limit)
         flush_index = 0
+        last_sig = None
+        folder = ScopeSubsetFolder()
         while True:
             item = await sections_queue.get()
             if item is done_sentinel:
+                for emit in folder.flush():
+                    sec = format_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
+                    buffer_sections.append(sec)
+                    buffer.add(sec, build_prompt(sections=[sec], separator="====", base_prompt=cfg.base_prompt, logger=logger))
                 if buffer_sections:
                     flush_index += 1
                     await _flush_buffer(
@@ -284,6 +363,7 @@ async def run_pipeline(config_path: str | None = None):
                         separator="====",
                         test_mode=cfg.test_mode,
                         analyze_llm_test_mode=cfg.analyze_llm_test_mode,
+                        base_prompt=cfg.base_prompt,
                         prompt_out_dir=prompt_out_dir,
                         response_out_dir=response_out_dir,
                         llm_client=llm_client,
@@ -293,26 +373,37 @@ async def run_pipeline(config_path: str | None = None):
                     )
                     buffer.clear()
                 break
-            section = item.get("section") or {}
-            section_text = build_prompt(sections=[section], separator="====", logger=logger)
-            if not buffer.can_add(section_text) and buffer_sections:
-                flush_index += 1
-                await _flush_buffer(
-                    sections=buffer_sections,
-                    separator="====",
-                    test_mode=cfg.test_mode,
-                    analyze_llm_test_mode=cfg.analyze_llm_test_mode,
-                    prompt_out_dir=prompt_out_dir,
-                    response_out_dir=response_out_dir,
-                    llm_client=llm_client,
-                    llm_call_index=(worker_id * 100000 + flush_index),
-                    analyze_sem=analyze_sem,
-                    logger=logger,
-                )
-                buffer_sections = []
-                buffer.clear()
-            buffer_sections.append(section)
-            buffer.add(section, section_text)
+            sig = item.get("sig")
+            if sig is None:
+                last_sig = None
+            else:
+                if last_sig is not None and sig == last_sig:
+                    continue
+                last_sig = sig
+            item["mark_seqs"] = [item.get("seq")]
+            emits = folder.push(item)
+            for emit in emits:
+                sec = format_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
+                sec_text = build_prompt(sections=[sec], separator="====", base_prompt=cfg.base_prompt, logger=logger)
+                if not buffer.can_add(sec_text) and buffer_sections:
+                    flush_index += 1
+                    await _flush_buffer(
+                        sections=buffer_sections,
+                        separator="====",
+                        test_mode=cfg.test_mode,
+                        analyze_llm_test_mode=cfg.analyze_llm_test_mode,
+                        base_prompt=cfg.base_prompt,
+                        prompt_out_dir=prompt_out_dir,
+                        response_out_dir=response_out_dir,
+                        llm_client=llm_client,
+                        llm_call_index=(worker_id * 100000 + flush_index),
+                        analyze_sem=analyze_sem,
+                        logger=logger,
+                    )
+                    buffer_sections = []
+                    buffer.clear()
+                buffer_sections.append(sec)
+                buffer.add(sec, sec_text)
 
     await asyncio.gather(producer(), *(worker(i + 1) for i in range(int(cfg.buffer_count))))
     logger.info("pipeline_done")
