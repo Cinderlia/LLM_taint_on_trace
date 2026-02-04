@@ -208,7 +208,7 @@ def _compute_this_context(t: dict, *, tseq, ctx: dict | None = None, calls_edges
             if should_resolve:
                 try:
                     from . import ast_var
-                    from cpg_utils.graph_mapping import resolve_this_object_chain
+                    from utils.cpg_utils.graph_mapping import resolve_this_object_chain
 
                     ast_var.ensure_trace_index(ctx)
                     recs = ctx.get('trace_index_records') or []

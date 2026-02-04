@@ -1,3 +1,7 @@
+"""
+Local test helpers for simulating LLM responses and persisting prompt/response artifacts.
+"""
+
 import json
 import os
 import sys

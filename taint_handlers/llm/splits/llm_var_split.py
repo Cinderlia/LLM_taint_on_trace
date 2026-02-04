@@ -1,6 +1,6 @@
 import re
 
-from extractors.if_extract import get_string_children, find_first_var_string
+from utils.extractors.if_extract import get_string_children, find_first_var_string
 
 
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')

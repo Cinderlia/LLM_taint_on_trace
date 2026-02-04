@@ -1,3 +1,7 @@
+"""
+Expand IF/SWITCH seq groups by taint-scoping: find nearby trace lines that influence branch conditions.
+"""
+
 import os
 import sys
 import bisect
@@ -8,10 +12,10 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from analyze_if_line import read_trace_line, extract_if_elements_fast, build_initial_taints, parse_loc
-from extractors.if_extract import norm_trace_path
+from utils.extractors.if_extract import norm_trace_path
 from taint_handlers import REGISTRY
 from taint_handlers.llm.core.llm_response import _node_source_str_with_this, _norm_llm_name
-from cpg_utils.graph_mapping import get_string_children
+from utils.cpg_utils.graph_mapping import get_string_children
 from llm_utils.prompts.prompt_utils import build_seqs_by_loc
 
 
@@ -276,6 +280,7 @@ def _build_ctx_for_seq(
 
 
 def _collect_scope_locs(taint: dict, base_ctx: dict) -> list:
+    """Run a taint handler to collect scope locations (and includes) relevant to the given taint."""
     tt = (taint.get('type') or '').strip()
     handler = REGISTRY.get(tt)
     if handler is None:
@@ -453,6 +458,7 @@ def _match_scope_nodes(
     loc_to_records: dict[tuple[str, int], list[dict]],
     loc_to_min_seq: dict[tuple[str, int], int],
 ) -> set[int]:
+    """Return seqs whose nodes in the given scope match the target variable/call name parts."""
     out: set[int] = set()
     if not target_parts:
         return out
@@ -509,6 +515,7 @@ def _select_near_far(
     near_count: int,
     far_count: int,
 ) -> list[int]:
+    """Pick a small set of seqs closest/farthest from ref_seq, keeping uniqueness and stable ordering."""
     items = []
     for s in seqs or []:
         try:
@@ -543,6 +550,7 @@ def expand_if_seq_groups(
     nearest_seq_count: int = 3,
     farthest_seq_count: int = 3,
 ) -> dict[int, list[int]]:
+    """Expand each seed seq by collecting taint scopes and selecting nearby/farthest relevant seqs."""
     seq_to_index = {}
     for rec in trace_index_records or []:
         idx = rec.get('index')

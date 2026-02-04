@@ -1,3 +1,7 @@
+"""
+Infer whether an IF statement took the true or false branch based on trace index records.
+"""
+
 from __future__ import annotations
 
 import json
@@ -125,6 +129,7 @@ def infer_if_direction(
     nodes: dict[int, dict],
     children_of: dict[int, list[int]],
 ) -> IfDirection:
+    """Determine branch direction by checking the next trace location against IF-true stmt lines."""
     if_path = (if_record.get("path") or "").strip()
     if_line = _safe_int(if_record.get("line"))
     seqs = [x for x in (if_record.get("seqs") or []) if _safe_int(x) is not None]
@@ -169,6 +174,7 @@ def infer_if_directions_for_seqs(
     nodes: dict[int, dict],
     children_of: dict[int, list[int]],
 ) -> list[IfDirection]:
+    """Compute IfDirection entries for each candidate seq that maps to an IF record."""
     seq_set = {int(s) for s in (seqs or []) if _safe_int(s) is not None}
     if not seq_set:
         return []
@@ -196,4 +202,3 @@ def infer_if_directions_for_seqs(
                 )
             )
     return out
-

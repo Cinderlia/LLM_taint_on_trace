@@ -11,12 +11,12 @@ import os
 import sys
 csv.field_size_limit(10**9)
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from common.app_config import load_app_config
-from cpg_utils.graph_mapping import (
+from utils.cpg_utils.graph_mapping import (
     find_first_var_string,
     get_all_string_descendants,
     get_string_children,
@@ -371,3 +371,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

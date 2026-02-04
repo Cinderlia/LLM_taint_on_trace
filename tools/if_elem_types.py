@@ -6,7 +6,7 @@ This is a small dataset inspection utility that writes `if_elem_types.txt`.
 
 import csv
 import os
-from ast_utils.var_utils import build_children_parent, extract_varlike_for_nodes
+from utils.ast_utils.var_utils import build_children_parent, extract_varlike_for_nodes
 from common.app_config import load_app_config
 csv.field_size_limit(10**9)
 

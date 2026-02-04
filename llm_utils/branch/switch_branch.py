@@ -1,3 +1,7 @@
+"""
+Infer which SWITCH case executed based on trace index records and AST_SWITCH_CASE statement lines.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -177,6 +181,7 @@ def infer_switch_choice(
     nodes: dict[int, dict],
     children_of: dict[int, list[int]],
 ) -> SwitchChoice:
+    """Infer the chosen case by matching the next executed location against each case's stmt list."""
     switch_path = (switch_record.get("path") or "").strip()
     switch_line = _safe_int(switch_record.get("line"))
     seqs = [x for x in (switch_record.get("seqs") or []) if _safe_int(x) is not None]
@@ -224,6 +229,7 @@ def infer_switch_choices_for_seqs(
     nodes: dict[int, dict],
     children_of: dict[int, list[int]],
 ) -> list[SwitchChoice]:
+    """Compute SwitchChoice entries for each candidate seq that maps to a SWITCH record."""
     seq_set = {int(s) for s in (seqs or []) if _safe_int(s) is not None}
     if not seq_set:
         return []
@@ -291,6 +297,7 @@ def build_seq_to_case_label(switch_choices: list[SwitchChoice]) -> dict[int, str
 
 
 def insert_mapped_items_after_seq(mapped: list[dict], *, after_seq: int, insert_items: list[dict]) -> list[dict]:
+    """Insert mapped items after a given seq, deduping by (path,line)."""
     if not mapped:
         return list(insert_items or [])
     if not insert_items:
@@ -348,6 +355,7 @@ def build_switch_case_result_set_for_seq(
     nodes: dict[int, dict],
     children_of: dict[int, list[int]],
 ) -> list[dict]:
+    """Return a result-set of (path,line) locations for all cases in the switch at input_seq."""
     try:
         input_seq_i = int(input_seq)
     except Exception:

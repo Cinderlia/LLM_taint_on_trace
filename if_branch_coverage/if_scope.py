@@ -1,4 +1,8 @@
-from cpg_utils.graph_mapping import resolve_top_id, safe_int
+"""
+Helpers to map an AST_IF id to source file and branch statement line sets.
+"""
+
+from utils.cpg_utils.graph_mapping import resolve_top_id, safe_int
 from llm_utils.branch.if_branch import collect_stmt_list_lines, get_if_elems, get_stmt_list_id
 
 
@@ -11,6 +15,7 @@ def is_ast_if(if_id, nodes: dict[int, dict]) -> bool:
 
 
 def get_if_branch_lines(if_id, nodes: dict[int, dict], children_of: dict[int, list[int]]) -> tuple[set[int], set[int]]:
+    """Return (true_branch_lines, false_branch_lines) for the IF's then/else statement lists."""
     nid = safe_int(if_id)
     if nid is None:
         return set(), set()

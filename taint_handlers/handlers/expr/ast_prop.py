@@ -6,7 +6,7 @@ method calls on the same receiver, collecting relevant scopes that may assign or
 depend on the property.
 """
 
-from extractors.if_extract import get_string_children, find_first_var_string
+from utils.extractors.if_extract import get_string_children, find_first_var_string
 
 from . import ast_var
 from ..call import ast_method_call

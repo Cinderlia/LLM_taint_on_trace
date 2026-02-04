@@ -1,3 +1,7 @@
+"""
+Run LLM-assisted symbolic-execution prompts and normalize the JSON solutions output.
+"""
+
 import asyncio
 import json
 import os
@@ -137,6 +141,7 @@ def write_symbolic_response(text: str, *, run_dir: str, seq: int) -> tuple[str, 
     return raw_path, json_path
 
 
+# Summary: Execute a symbolic-execution prompt (or reuse offline outputs) and persist prompt/response artifacts.
 def run_symbolic_prompt(
     prompt_text: str,
     *,

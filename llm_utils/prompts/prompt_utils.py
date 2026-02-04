@@ -12,7 +12,7 @@ from typing import Any
 import json
 import os
 
-from extractors.if_extract import norm_trace_path
+from utils.extractors.if_extract import norm_trace_path
 
 
 def render_template(template: str, **kwargs: Any) -> str:
@@ -493,6 +493,7 @@ def locs_to_scope_seqs(locs, ctx, *, ref_seq: int | None, prefer: str = 'forward
     return out
 
 
+# Summary: Dedupe LLM scope requests by skipping scopes already covered by prior calls.
 def should_skip_llm_scope(scope_seqs, ctx, *, dedupe_key: str | None = None) -> bool:
     """Return True if a given scope has already been processed for LLM calls."""
     if not isinstance(ctx, dict):

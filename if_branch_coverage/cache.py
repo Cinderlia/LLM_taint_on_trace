@@ -1,8 +1,13 @@
+"""
+Small persistent cache for IF-branch coverage results (node_id -> covered bool).
+"""
+
 import json
 import os
 
 
 class IfBranchCoverageCache:
+    """File-backed cache for per-AST_IF coverage checks."""
     def __init__(self, cache_path: str):
         self._cache: dict[int, bool] = {}
         self._cache_path = cache_path or ""

@@ -1,3 +1,7 @@
+"""
+Load and normalize configuration for the branch-selection pipeline.
+"""
+
 import json
 import os
 from dataclasses import dataclass
@@ -27,6 +31,7 @@ def _default_config() -> BranchSelectorConfig:
     return BranchSelectorConfig()
 
 
+# Summary: Resolve config.json location and coerce fields into a BranchSelectorConfig instance.
 def load_config(config_path: str | None = None) -> BranchSelectorConfig:
     base = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(base)

@@ -1,3 +1,7 @@
+"""
+Parse the LLM response for branch selection into groups of trace sequence numbers.
+"""
+
 import json
 import os
 import random
@@ -11,6 +15,7 @@ if _ROOT not in sys.path:
 from common.logger import Logger
 
 
+# Summary: Decode JSON produced by the LLM into groups of integer seqs (tolerant to minor format variants).
 def parse_llm_response(text: str, logger: Logger | None = None) -> list[list[int]]:
     if not isinstance(text, str):
         return []

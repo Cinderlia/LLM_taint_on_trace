@@ -3,9 +3,9 @@ import sys
 import json
 
 from analyze_if_line import read_trace_line, extract_if_elements_fast
-from extractors.if_extract import load_nodes, load_ast_edges
+from utils.extractors.if_extract import load_nodes, load_ast_edges
 from taint_handlers.handlers.expr import ast_prop
-from trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
+from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 from common.app_config import load_app_config
 
 

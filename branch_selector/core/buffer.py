@@ -1,3 +1,7 @@
+"""
+Lightweight token-based buffering utilities for grouping prompt sections.
+"""
+
 import asyncio
 
 
@@ -41,4 +45,3 @@ class BufferPool:
 
     def release(self, idx: int):
         self.queue.put_nowait(int(idx))
-

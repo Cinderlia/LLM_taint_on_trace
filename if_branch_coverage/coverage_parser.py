@@ -1,8 +1,12 @@
+"""
+Parse line-coverage reports (cc.json) into fast lookup structures for branch coverage checks.
+"""
+
 import glob
 import json
 import os
 
-from cpg_utils.graph_mapping import norm_nodes_path, safe_int
+from utils.cpg_utils.graph_mapping import norm_nodes_path, safe_int
 
 
 def find_cc_json(input_dir: str) -> str:
@@ -25,6 +29,7 @@ def load_coverage(cc_path: str) -> dict:
 
 
 def build_coverage_index(raw: dict) -> dict[str, dict[int, int]]:
+    """Normalize raw coverage payload into {normalized_path: {line: status}}."""
     out: dict[str, dict[int, int]] = {}
     for path, line_map in (raw or {}).items():
         if not isinstance(line_map, dict):

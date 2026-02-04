@@ -10,8 +10,8 @@ This module contains shared logic for call-like nodes:
 import os
 import re
 from common.app_config import load_app_config
-from extractors.if_extract import norm_trace_path, resolve_top_id
-from cpg_utils.graph_mapping import ensure_trace_edges_csv
+from utils.extractors.if_extract import norm_trace_path, resolve_top_id
+from utils.cpg_utils.graph_mapping import ensure_trace_edges_csv
 from ..expr.ast_var import ensure_trace_index, record_taint_source
 
 _ALLOWED_CALL_ARG_TYPES = {'AST_CALL', 'AST_METHOD_CALL', 'AST_DIM', 'AST_VAR', 'AST_PROP'}
@@ -764,7 +764,7 @@ def process_call_like(taint, ctx, *, debug_key: str = 'ast_method_call'):
         if not nodes2 or not children_of2 or not recs2 or not seq_to_idx2:
             return out
         try:
-            from cpg_utils.graph_mapping import method_call_receiver_name
+            from utils.cpg_utils.graph_mapping import method_call_receiver_name
         except Exception:
             method_call_receiver_name = None
         if method_call_receiver_name is None:

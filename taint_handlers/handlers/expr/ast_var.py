@@ -7,8 +7,8 @@ collects trace locations likely affecting the current variable taint.
 
 import os
 from common.app_config import load_app_config
-from trace_utils.trace_edges import build_trace_index_records
-from cpg_utils.graph_mapping import build_funcid_to_call_ids, find_nearest_callsite_locator, read_calls_edges_union
+from utils.trace_utils.trace_edges import build_trace_index_records
+from utils.cpg_utils.graph_mapping import build_funcid_to_call_ids, find_nearest_callsite_locator, read_calls_edges_union
 
 _LAST_TRACE_CTX = None
  

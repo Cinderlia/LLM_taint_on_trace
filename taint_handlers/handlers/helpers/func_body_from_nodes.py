@@ -1,7 +1,7 @@
 import os
 import sys
 
-from cpg_utils.graph_mapping import load_nodes, load_ast_edges, resolve_top_id
+from utils.cpg_utils.graph_mapping import load_nodes, load_ast_edges, resolve_top_id
 from llm_utils.prompts.prompt_utils import resolve_source_path
 
 

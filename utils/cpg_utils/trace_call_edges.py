@@ -1,12 +1,14 @@
 """
-Utilities for building trace indices and inferring call edges from trace/CPG tables.
+Infer supplemental `CALLS` edges from adjacent trace groups.
 
 This script reads:
-- `trace.log` to group dynamic trace lines by `(path,line)` and assign seqs
+- `trace.log` to group dynamic trace lines by `(path,line)`
 - Joern CPG exports (`nodes.csv`, `rels.csv`, `cpg_edges.csv`) for AST metadata
 
-It produces indices (`trace_index.json`, `trace_debug.json`) and optionally a
-supplemental `trace_edges.csv` containing inferred `CALLS` edges.
+It produces:
+- `tmp/trace_edges.csv` inferred `CALLS` edges
+- `test/trace_edges/trace_debug.json` debug rows
+- `test/trace_edges/trace_stats.txt` summary stats
 """
 
 import csv
@@ -14,24 +16,14 @@ import os
 import json
 import sys
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from common.app_config import load_app_config
-from cpg_utils.trace_index import (
-    build_nodes_index,
-    build_trace_index_records,
-    load_ast_edges,
-    load_nodes_meta,
-    load_trace_index_records,
-    norm_nodes_path,
-    norm_trace_path,
-    read_trace_groups,
-    read_trace_groups_with_seqs,
-    save_trace_index_records,
-)
-from ast_utils.var_utils import build_children_parent, extract_varlike_for_nodes
+from utils.cpg_utils.trace_index import build_nodes_index, load_nodes_meta, read_trace_groups
+from utils.ast_utils.var_utils import build_children_parent, extract_varlike_for_nodes
+
 
 def get_string_children(nid, children_of, nodes_meta):
     """Return direct child string nodes (id, text) for a node id."""
@@ -45,6 +37,8 @@ def get_string_children(nid, children_of, nodes_meta):
             if v:
                 vals.append(v)
     return vals
+
+
 def get_all_string_descendants(nid, children_of, nodes_meta):
     """Return all descendant string values (text only) under an AST node."""
     vals = []
@@ -64,6 +58,7 @@ def get_all_string_descendants(nid, children_of, nodes_meta):
         for c in children_of.get(x, []) or []:
             q.append(c)
     return vals
+
 
 def find_first_var_string(nid, children_of, nodes_meta):
     """Find the first `AST_VAR` descendant's string name under `nid`."""
@@ -85,6 +80,7 @@ def find_first_var_string(nid, children_of, nodes_meta):
             q.append(c)
     return ''
 
+
 def collect_descendants_on_line(root, children_of, nodes_meta, line):
     """Collect descendants of `root` that have `lineno == line` in `nodes_meta`."""
     res = []
@@ -102,6 +98,7 @@ def collect_descendants_on_line(root, children_of, nodes_meta, line):
         for c in children_of.get(x, []) or []:
             q.append(c)
     return res
+
 
 def extract_variables_for_line(if_elem_ids, line, children_of, nodes_meta):
     """Extract variable-like items from if-element subtrees on the given line."""
@@ -149,6 +146,7 @@ def extract_variables_for_line(if_elem_ids, line, children_of, nodes_meta):
                     seen_ids.add(x)
     return out
 
+
 def extract_variables_for_nodes(node_entries, children_of, nodes_meta):
     """Extract variable-like items from a set of node ids or `(id, ...)` entries."""
     out = []
@@ -195,6 +193,7 @@ def extract_variables_for_nodes(node_entries, children_of, nodes_meta):
                 seen_ids.add(x)
     return out
 
+
 def read_existing_calls(edges_path):
     """Load existing `CALLS` edges from a `cpg_edges.csv`-like TSV file."""
     calls = set()
@@ -216,6 +215,7 @@ def read_existing_calls(edges_path):
             calls.add((si, ei))
     return calls
 
+
 def norm_call_name(s):
     """Normalize a call name to a lowercase identifier-like prefix."""
     s = (s or '').strip().lower()
@@ -228,6 +228,7 @@ def norm_call_name(s):
         else:
             break
     return ''.join(out)
+
 
 def get_call_name_candidates(call_name_raw):
     names = []
@@ -247,6 +248,7 @@ def get_call_name_candidates(call_name_raw):
             names.append(tail_norm)
     return names
 
+
 def get_node_best_name(nid, nodes_meta, children_of):
     """Pick the most human-readable name for a node using name/string/code fields."""
     nx = nodes_meta.get(nid) or {}
@@ -261,6 +263,7 @@ def get_node_best_name(nid, nodes_meta, children_of):
         return code
     return ''
 
+
 def get_string_value(nid, nodes_meta):
     """Return the string literal value for a node if it is a string node."""
     nx = nodes_meta.get(nid) or {}
@@ -269,6 +272,7 @@ def get_string_value(nid, nodes_meta):
         return v
     return ''
 
+
 def get_ast_name_string_child(ast_name_id, children_of, nodes_meta):
     """Return the first direct string child value under an `AST_NAME` node."""
     for c in children_of.get(ast_name_id, []) or []:
@@ -276,6 +280,7 @@ def get_ast_name_string_child(ast_name_id, children_of, nodes_meta):
         if v:
             return v
     return ''
+
 
 def get_static_call_name(call_id, children_of, nodes_meta):
     class_name = ''
@@ -298,6 +303,7 @@ def get_static_call_name(call_id, children_of, nodes_meta):
         return class_name
     return ''
 
+
 def get_direct_callsite_name(call_id, children_of, nodes_meta):
     """Extract a direct callsite name from immediate children of a call node."""
     for c in children_of.get(call_id, []) or []:
@@ -313,6 +319,7 @@ def get_direct_callsite_name(call_id, children_of, nodes_meta):
             if v2:
                 return v2
     return ''
+
 
 def find_descendant_callsite_name(call_id, children_of, nodes_meta):
     """Find a callsite name by searching descendants (fallback when direct name missing)."""
@@ -338,6 +345,7 @@ def find_descendant_callsite_name(call_id, children_of, nodes_meta):
             q.append(c)
     return ''
 
+
 def get_call_name(nid, nodes_meta, children_of):
     """Resolve a call expression's name from multiple possible AST encodings."""
     nx = nodes_meta.get(nid) or {}
@@ -358,6 +366,7 @@ def get_call_name(nid, nodes_meta, children_of):
     if code:
         return code
     return ''
+
 
 def get_decl_name(nid, nodes_meta, children_of):
     """Resolve a callee declaration name from a declaration node subtree."""
@@ -382,6 +391,7 @@ def get_decl_name(nid, nodes_meta, children_of):
     if code:
         return code
     return ''
+
 
 def pick_call_edge(a_id, a_type, dst_type, dst_candidates, nodes_meta, children_of, existing_calls, guard_calls):
     """Pick the best callee among candidates using normalized name matching heuristics."""
@@ -433,9 +443,11 @@ def pick_call_edge(a_id, a_type, dst_type, dst_candidates, nodes_meta, children_
         'edge_exists': edge_exists,
     }
 
+
 def main():
     """CLI entrypoint: build `trace_debug.json` and infer supplemental `CALLS` edges."""
-    cfg = load_app_config(config_path=os.path.join(_ROOT, 'config.json'), argv=sys.argv[1:], base_dir=_ROOT)
+    cfg = load_app_config(argv=sys.argv[1:])
+    base = cfg.base_dir
     trace_path = cfg.find_input_file('trace.log')
     nodes_path = cfg.find_input_file('nodes.csv')
     edges_path = cfg.find_input_file('cpg_edges.csv')
@@ -466,20 +478,22 @@ def main():
         ids = [str(n[0]) for n in nodes]
         types = [n[2] for n in nodes]
         has_method_call = any(t == 'AST_METHOD_CALL' for t in types)
-        has_call = any(t in ('AST_CALL', 'AST_STATIC_CALL') for t in types)
-        call_nodes = [n for n in nodes if n[2] in ('AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL')]
+        has_call = any(t == 'AST_CALL' for t in types)
+        call_nodes = [n for n in nodes if n[2] in ('AST_METHOD_CALL', 'AST_CALL')]
         variables = extract_varlike_for_nodes(nodes, children_of, parent_of, nodes_meta)
-        debug_rows.append({
-            'index': i,
-            'path': g['path'],
-            'line': g['line'],
-            'matched': 'yes' if nodes else 'no',
-            'node_ids': ','.join(ids),
-            'node_types': ','.join(types),
-            'has_ast_method_call': 'yes' if has_method_call else 'no',
-            'has_ast_call': 'yes' if has_call else 'no',
-            'variables': variables
-        })
+        debug_rows.append(
+            {
+                'index': i,
+                'path': g['path'],
+                'line': g['line'],
+                'matched': 'yes' if nodes else 'no',
+                'node_ids': ','.join(ids),
+                'node_types': ','.join(types),
+                'has_ast_method_call': 'yes' if has_method_call else 'no',
+                'has_ast_call': 'yes' if has_call else 'no',
+                'variables': variables,
+            }
+        )
         if not call_nodes:
             continue
         j = i + 1
@@ -496,7 +510,7 @@ def main():
         for cn in call_nodes:
             a_id = cn[0]
             a_type = cn[2]
-            if a_type in ('AST_METHOD_CALL', 'AST_STATIC_CALL'):
+            if a_type == 'AST_METHOD_CALL':
                 dst_type = 'AST_METHOD'
             else:
                 dst_type = 'AST_FUNC_DECL'
@@ -529,31 +543,32 @@ def main():
                 else:
                     trace_edges.append((a_id, picked, 'CALLS', ''))
 
-            debug_rows.append({
-                'index': f'{i}->{j}',
-                'path': f'{g["path"]} -> {ng["path"]}',
-                'line': f'{g["line"]} -> {ng["line"]}',
-                'matched': 'pair',
-                'node_ids': f'{a_id if a_id is not None else ""},{picked if picked is not None else ""}',
-                'node_types': f'{a_type},{dst_type}',
-                'call_name': call_name_raw,
-                'decl_name': picked_name_raw,
-                'name_match': name_match,
-                'picked_by': picked_by,
-                'edge_exists_in_cpg_edges': 'skipped' if skipped else ('yes' if edge_exists else 'no')
-            })
-    # dedup output edges (easy to remove later)
+            debug_rows.append(
+                {
+                    'index': f'{i}->{j}',
+                    'path': f'{g["path"]} -> {ng["path"]}',
+                    'line': f'{g["line"]} -> {ng["line"]}',
+                    'matched': 'pair',
+                    'node_ids': f'{a_id if a_id is not None else ""},{picked if picked is not None else ""}',
+                    'node_types': f'{a_type},{dst_type}',
+                    'call_name': call_name_raw,
+                    'decl_name': picked_name_raw,
+                    'name_match': name_match,
+                    'picked_by': picked_by,
+                    'edge_exists_in_cpg_edges': 'skipped' if skipped else ('yes' if edge_exists else 'no'),
+                }
+            )
+
     edges_out = list(dict.fromkeys(trace_edges))
     out_edges_path = cfg.tmp_path('trace_edges.csv')
     out_debug_dir = cfg.test_path('trace_edges')
     os.makedirs(os.path.dirname(out_edges_path) or '.', exist_ok=True)
     os.makedirs(out_debug_dir, exist_ok=True)
-    if edges_out:
-        with open(out_edges_path, 'w', encoding='utf-8', newline='') as f:
-            w = csv.writer(f, delimiter='\t')
-            w.writerow(['start', 'end', 'type', 'var'])
-            for a, b, t, v in edges_out:
-                w.writerow([a, b, t, v])
+    with open(out_edges_path, 'w', encoding='utf-8', newline='') as f:
+        w = csv.writer(f, delimiter='\t')
+        w.writerow(['start', 'end', 'type', 'var'])
+        for a, b, t, v in edges_out:
+            w.writerow([a, b, t, v])
     with open(os.path.join(out_debug_dir, 'trace_debug.json'), 'w', encoding='utf-8') as f:
         json.dump(debug_rows, f, ensure_ascii=False, indent=2)
     with open(os.path.join(out_debug_dir, 'trace_stats.txt'), 'w', encoding='utf-8') as f:
@@ -561,6 +576,6 @@ def main():
         f.write(f'missing_edges={len(edges_out)}\n')
         f.write(f'existing_edges_in_cpg_edges={existed_count}\n')
 
-if __name__ == '__main__':
-    main()
 
+if __name__ == "__main__":
+    main()

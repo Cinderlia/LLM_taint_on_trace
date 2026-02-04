@@ -110,13 +110,13 @@ def _import_switch_branch_utils():
 
 def _import_graph_mapping():
     try:
-        from cpg_utils.graph_mapping import load_ast_edges, load_nodes
+        from utils.cpg_utils.graph_mapping import load_ast_edges, load_nodes
         return load_nodes, load_ast_edges
     except Exception:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if root not in sys.path:
             sys.path.insert(0, root)
-        from cpg_utils.graph_mapping import load_ast_edges, load_nodes
+        from utils.cpg_utils.graph_mapping import load_ast_edges, load_nodes
         return load_nodes, load_ast_edges
 
 
@@ -264,6 +264,7 @@ def _build_trace_seq_to_index(trace_index_records: list[dict]) -> dict[int, int]
     return out
 
 
+# Summary: Tag mapped source locations with the callsite whose implementation scope they fall into.
 def _build_loc_to_func_impl_tags(
     mapped: list[dict],
     *,
@@ -424,6 +425,7 @@ def _build_loc_to_func_impl_tags(
     return loc_to_tags
 
 
+# Summary: Build a single prompt that asks the LLM to symbolically flip IF/SWITCH branches for given seqs.
 def generate_symbolic_execution_prompt(
     result_set_or_path,
     *,

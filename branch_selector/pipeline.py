@@ -1,3 +1,8 @@
+"""
+Run the branch-selection pipeline: build prompt sections from trace traces, ask an LLM to pick branches,
+and trigger per-seq analysis runs.
+"""
+
 import asyncio
 import json
 import os
@@ -31,7 +36,7 @@ from branch_selector.trace.trace_extract import (
 )
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
 from if_branch_coverage import check_if_branch_coverage
-from cpg_utils.graph_mapping import safe_int
+from utils.cpg_utils.graph_mapping import safe_int
 
 
 def _safe_rmtree(p: str) -> None:
@@ -90,6 +95,7 @@ def _collect_if_ids_in_record(record: dict, nodes: dict, parent_of: dict[int, in
     return sorted(out)
 
 
+# Summary: Yield per-seq prompt sections by expanding/merging trace-derived IF/SWITCH neighborhoods.
 def _iter_if_switch_sections(
     *,
     trace_index_records: list[dict],
@@ -207,6 +213,7 @@ async def _handle_llm_response(seqs_groups: list[list[int]], *, llm_test_mode: b
         await asyncio.gather(*tasks)
 
 
+# Summary: Flush buffered sections to a prompt, get/simulate an LLM response, and schedule per-seq analysis.
 async def _flush_buffer(
     *,
     sections: list[dict],
@@ -276,6 +283,7 @@ async def _flush_buffer(
     await _handle_llm_response(resp_groups, llm_test_mode=analyze_llm_test_mode, sem=analyze_sem, logger=logger)
 
 
+# Summary: Orchestrate config loading, section production, buffering, LLM calls, and analysis execution.
 async def run_pipeline(config_path: str | None = None):
     cfg = load_config(config_path)
     app_cfg = load_app_config(argv=sys.argv[1:])

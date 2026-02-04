@@ -156,7 +156,7 @@ def _split_var_name_parts(name: str) -> set[str]:
 
 def _collect_varlike_names_from_node(nid: int, nodes: dict[int, dict], children_of: dict[int, list[int]], parent_of: dict[int, int]) -> set[str]:
     try:
-        from ast_utils.var_utils import extract_varlike_for_nodes
+        from utils.ast_utils.var_utils import extract_varlike_for_nodes
     except Exception:
         extract_varlike_for_nodes = None
     if extract_varlike_for_nodes is None:
@@ -208,7 +208,7 @@ def _is_define_name_node(nid: int, nodes: dict[int, dict], children_of: dict[int
     if _node_type(nid, nodes) != "AST_NAME":
         return False
     try:
-        from ast_utils.var_utils import get_string_children
+        from utils.ast_utils.var_utils import get_string_children
     except Exception:
         get_string_children = None
     if get_string_children is None:

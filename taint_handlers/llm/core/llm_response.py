@@ -8,7 +8,7 @@ variable components for better coverage.
 
 import re
 
-from extractors.if_extract import get_all_string_descendants, get_string_children, find_first_var_string
+from utils.extractors.if_extract import get_all_string_descendants, get_string_children, find_first_var_string
 
 
 _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -225,7 +225,7 @@ def effective_llm_incoming_sources(node: dict, node_key: tuple[int, int], llm_in
         return set(inc)
     if tt in ('AST_CALL', 'AST_STATIC_CALL'):
         try:
-            from cpg_utils.graph_mapping import base_var_name_for_node, call_arg_base_names, is_in_call_arg_subtree
+            from utils.cpg_utils.graph_mapping import base_var_name_for_node, call_arg_base_names, is_in_call_arg_subtree
         except Exception:
             base_var_name_for_node = None
             call_arg_base_names = None
@@ -258,7 +258,7 @@ def effective_llm_incoming_sources(node: dict, node_key: tuple[int, int], llm_in
         return out
     if tt == 'AST_METHOD_CALL':
         try:
-            from cpg_utils.graph_mapping import (
+            from utils.cpg_utils.graph_mapping import (
                 base_var_name_for_node,
                 call_arg_base_names,
                 is_in_call_arg_subtree,
@@ -306,7 +306,7 @@ def effective_llm_incoming_sources(node: dict, node_key: tuple[int, int], llm_in
             out.add(sk)
         return out
     try:
-        from cpg_utils.graph_mapping import base_var_name_for_node, dim_index_base_names, is_in_dim_index_subtree
+        from utils.cpg_utils.graph_mapping import base_var_name_for_node, dim_index_base_names, is_in_dim_index_subtree
     except Exception:
         base_var_name_for_node = None
         dim_index_base_names = None

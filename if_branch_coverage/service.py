@@ -1,5 +1,9 @@
+"""
+IF-branch coverage lookup based on CPG node ids and line-coverage (cc.json) reports.
+"""
+
 from common.app_config import load_app_config
-from cpg_utils.graph_mapping import load_ast_edges, load_nodes, norm_nodes_path, safe_int
+from utils.cpg_utils.graph_mapping import load_ast_edges, load_nodes, norm_nodes_path, safe_int
 
 import os
 
@@ -9,6 +13,7 @@ from if_branch_coverage.if_scope import get_if_branch_lines, get_if_file_path, i
 
 
 class IfBranchCoverageService:
+    """Load coverage data and answer whether both IF branches are covered for a given AST_IF id."""
     def __init__(self, *, config_path: str | None = None, argv: list[str] | None = None, base_dir: str | None = None):
         cfg = load_app_config(config_path=config_path, argv=argv, base_dir=base_dir)
         self.config = cfg
@@ -23,6 +28,7 @@ class IfBranchCoverageService:
         self.coverage_index = build_coverage_index(load_coverage(self.cc_path)) if self.cc_path else {}
 
     def check_if_coverage(self, if_id) -> bool:
+        """Return True if the IF's true-branch and false-branch have coverage evidence."""
         nid = safe_int(if_id)
         if nid is None:
             return False
@@ -53,6 +59,7 @@ _DEFAULT_CONFIG_KEY: str = ""
 
 
 def get_service(config_path: str | None = None) -> IfBranchCoverageService:
+    """Return a cached service instance, keyed by config_path."""
     global _DEFAULT_SERVICE, _DEFAULT_CONFIG_KEY
     key = (config_path or "").strip()
     if _DEFAULT_SERVICE is None or _DEFAULT_CONFIG_KEY != key:
@@ -62,5 +69,6 @@ def get_service(config_path: str | None = None) -> IfBranchCoverageService:
 
 
 def check_if_branch_coverage(if_id, config_path: str | None = None) -> bool:
+    """Convenience wrapper around the default IfBranchCoverageService."""
     svc = get_service(config_path=config_path)
     return svc.check_if_coverage(if_id)

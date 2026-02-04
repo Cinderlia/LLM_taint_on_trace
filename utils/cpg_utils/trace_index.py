@@ -8,6 +8,11 @@ Provides utilities to:
 - read/write `trace_index.json` cache files
 """
 
+# Summary: Build a trace_index.json by joining trace.log seq groups with nodes.csv locations.
+#
+# This module also provides low-level utilities for normalizing paths, grouping trace records by location,
+# and indexing nodes.csv by (path,line).
+
 import csv
 import os
 import json
@@ -334,4 +339,3 @@ def load_ast_edges(rels_path):
                 children_of[si] = lst
             lst.append(ei)
     return children_of
-

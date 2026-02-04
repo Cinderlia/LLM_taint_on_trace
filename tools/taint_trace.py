@@ -12,8 +12,8 @@ performs a simple taint expansion over:
 import os
 import json
 import csv
-from ast_utils.var_utils import build_children_parent, get_string_children, get_all_string_descendants, extract_varlike_for_nodes
-from cpg_utils.graph_mapping import ensure_trace_edges_csv
+from utils.ast_utils.var_utils import build_children_parent, get_string_children, get_all_string_descendants, extract_varlike_for_nodes
+from utils.cpg_utils.graph_mapping import ensure_trace_edges_csv
 from common.app_config import load_app_config
 
 def norm_trace_path(p):

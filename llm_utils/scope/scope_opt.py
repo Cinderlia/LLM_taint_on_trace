@@ -1,3 +1,7 @@
+"""
+Scope-selection optimizations for LLM prompting (scope dedupe, parent-child scope relations, merging).
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -86,6 +90,7 @@ def record_parent_scope_for_enqueued_taint(*, ctx: dict, taint_key: tuple[int, i
 
 
 def merge_round_metas_by_scope(metas: list[dict]) -> list[dict]:
+    """Merge LLM round metadata when one scope is a subset of another to reduce calls."""
     groups: list[dict] = []
     for meta in metas or []:
         if not isinstance(meta, dict):

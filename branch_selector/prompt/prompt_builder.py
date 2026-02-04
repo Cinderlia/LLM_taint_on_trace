@@ -1,3 +1,7 @@
+"""
+Build the branch-selection prompt text and format per-seq code sections.
+"""
+
 import os
 import sys
 from collections.abc import Iterable
@@ -54,6 +58,7 @@ def build_prompt(*, sections: Iterable[dict], separator: str, base_prompt: str |
     return out
 
 
+# Summary: Collapse mapped source lines into a compact, optionally marked prompt section for one seq.
 def format_section(seq: int, lines: list[dict], mark_seqs: Iterable[int] | None = None, logger: Logger | None = None) -> dict:
     code_lines = []
     mark_set = set()

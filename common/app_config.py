@@ -1,3 +1,9 @@
+"""
+Application configuration loader for the trace/taint analysis pipeline.
+
+Resolves config.json from CLI/env, normalizes input/tmp/test paths, and exposes helpers to locate inputs.
+"""
+
 import json
 import os
 from dataclasses import dataclass
@@ -73,6 +79,7 @@ def _parse_kv_arg(argv: list[str], key: str) -> str | None:
 
 
 def load_app_config(*, config_path: str | None = None, argv: list[str] | None = None, base_dir: str | None = None) -> AppConfig:
+    """Load config.json and resolve key directories, with optional CLI overrides."""
     base = os.path.abspath(base_dir or os.getcwd())
     args = list(argv or [])
 

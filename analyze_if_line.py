@@ -14,7 +14,7 @@ import bisect
 import shutil
 from common.app_config import load_app_config
 from common.logger import Logger
-from extractors.if_extract import (
+from utils.extractors.if_extract import (
     norm_trace_path,
     collect_descendants,
     load_nodes,
@@ -25,7 +25,7 @@ from extractors.if_extract import (
 )
 from taint_handlers import REGISTRY
 from taint_handlers.llm.core.llm_process import process_taints_llm
-from trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
+from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 from llm_utils.prompts.symbolic_prompt import generate_symbolic_execution_prompt
 from llm_utils.symbolic_runner import build_symbolic_response_example, run_symbolic_prompt, write_symbolic_prompt, write_symbolic_response
 
@@ -324,7 +324,7 @@ def build_initial_taints(st, nodes, children_of, parent_of):
         except Exception:
             return False
         try:
-            from cpg_utils.graph_mapping import is_in_dim_index_subtree, is_in_method_call_receiver_subtree, subtree_contains
+            from utils.cpg_utils.graph_mapping import is_in_dim_index_subtree, is_in_method_call_receiver_subtree, subtree_contains
         except Exception:
             is_in_dim_index_subtree = None
             is_in_method_call_receiver_subtree = None

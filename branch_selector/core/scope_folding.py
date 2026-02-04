@@ -1,3 +1,7 @@
+"""
+Utilities for folding adjacent prompt sections when one scope is a subset of another.
+"""
+
 from collections.abc import Iterable
 
 

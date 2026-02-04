@@ -23,7 +23,7 @@ def _resolve_this_context(meta: dict, ctx: dict, calls_edges_union: dict) -> tup
     if start_seq is not None:
         try:
             from . import ast_var
-            from cpg_utils.graph_mapping import resolve_this_object_chain
+            from utils.cpg_utils.graph_mapping import resolve_this_object_chain
 
             nodes = ctx.get('nodes') or {}
             children_of = ctx.get('children_of') or {}

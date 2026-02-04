@@ -1,3 +1,7 @@
+"""
+Trace-index and CPG loading helpers for the branch-selection pipeline.
+"""
+
 import os
 import sys
 from typing import Iterable
@@ -7,12 +11,13 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from common.logger import Logger
-from extractors.if_extract import load_nodes, load_ast_edges
+from utils.extractors.if_extract import load_nodes, load_ast_edges
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
-from trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
+from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 
 
 def ensure_trace_index(trace_index_path: str, trace_path: str, nodes_path: str, seq_limit: int, logger: Logger | None = None) -> list[dict]:
+    """Load an existing trace-index JSON file or build and persist it from trace.log and nodes.csv."""
     recs = load_trace_index_records(trace_index_path)
     if recs is not None:
         if logger is not None:
@@ -59,6 +64,7 @@ def collect_if_switch_seqs(
     seq_limit: int,
     logger: Logger | None = None,
 ) -> dict[int, list[int]]:
+    """Collect candidate seqs that contain IF/SWITCH-related nodes, keyed by each record's min seq."""
     out: dict[int, list[int]] = {}
     seen_records = 0
     for rec in trace_index_records or []:
@@ -119,6 +125,7 @@ def seqs_to_source_groups(
     trace_index_path: str,
     windows_root: str,
 ) -> list[dict]:
+    """Map seq groups to source-line context objects suitable for prompt section formatting."""
     out: list[dict] = []
     for seq, rel_seqs in seq_groups.items():
         locs = []
