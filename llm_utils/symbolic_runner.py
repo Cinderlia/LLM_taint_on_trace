@@ -94,6 +94,209 @@ def parse_symbolic_response(text: str) -> list[dict]:
     return _normalize_solutions(obj)
 
 
+def _stringify_value(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return str(v)
+
+
+def _split_query_pairs(text: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    s = (text or "").strip()
+    if not s:
+        return out
+    for part in s.split("&"):
+        part_s = (part or "").strip()
+        if not part_s:
+            continue
+        if "=" in part_s:
+            k, v = part_s.split("=", 1)
+            out.append((k, v))
+        else:
+            out.append((part_s, ""))
+    return out
+
+
+def _pairs_to_query(pairs: list[tuple[str, str]]) -> str:
+    buf = []
+    for k, v in pairs:
+        ks = (k or "").strip()
+        vs = _stringify_value(v)
+        if not ks and not vs:
+            continue
+        buf.append(f"{ks}={vs}")
+    return "&".join(buf)
+
+
+def _normalize_export_line(line: str) -> str:
+    v = (line or "").strip()
+    if not v:
+        return ""
+    if v.startswith("export "):
+        return v
+    return "export " + v
+
+
+def _normalize_env_lines(env_obj, *, defaults: list[str] | None = None, use_default: bool = False) -> list[str]:
+    if use_default:
+        return list(defaults or [])
+    if env_obj is None:
+        return []
+    if isinstance(env_obj, dict):
+        return [_normalize_export_line(f"{k}={_stringify_value(v)}") for k, v in env_obj.items()]
+    if isinstance(env_obj, (list, tuple)):
+        out = []
+        for it in env_obj:
+            if isinstance(it, dict):
+                out.extend([_normalize_export_line(f"{k}={_stringify_value(v)}") for k, v in it.items()])
+                continue
+            if isinstance(it, (list, tuple)) and len(it) >= 2:
+                out.append(_normalize_export_line(f"{it[0]}={_stringify_value(it[1])}"))
+                continue
+            if isinstance(it, str):
+                v = it.strip()
+                if v:
+                    out.append(_normalize_export_line(v))
+                continue
+        return [x for x in out if x]
+    if isinstance(env_obj, str):
+        out = []
+        for line in env_obj.splitlines():
+            v = line.strip()
+            if v:
+                out.append(_normalize_export_line(v))
+        return [x for x in out if x]
+    return []
+
+
+def _normalize_request_field(field_obj, *, default_value: str, use_default: bool) -> str:
+    if use_default:
+        return (default_value or "").strip()
+    if field_obj is None:
+        return ""
+    if isinstance(field_obj, dict):
+        pairs = [(k, _stringify_value(v)) for k, v in field_obj.items()]
+        return _pairs_to_query(pairs).strip()
+    if isinstance(field_obj, (list, tuple)):
+        pairs: list[tuple[str, str]] = []
+        for it in field_obj:
+            if isinstance(it, dict):
+                for k, v in it.items():
+                    pairs.append((k, _stringify_value(v)))
+                continue
+            if isinstance(it, (list, tuple)) and len(it) >= 2:
+                pairs.append((it[0], _stringify_value(it[1])))
+                continue
+            if isinstance(it, str):
+                pairs.extend(_split_query_pairs(it))
+                continue
+        if pairs:
+            return _pairs_to_query(pairs).strip()
+        return ""
+    if isinstance(field_obj, str):
+        return field_obj.strip()
+    return _stringify_value(field_obj).strip()
+
+
+def _parse_test_command_text(text: str) -> dict:
+    env_lines: list[str] = []
+    cookie_value = ""
+    get_value = ""
+    post_value = ""
+    if not isinstance(text, str) or not text.strip():
+        return {"env_lines": env_lines, "COOKIE": cookie_value, "GET": get_value, "POST": post_value}
+    for raw in text.splitlines() or []:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if line.startswith("export "):
+            rest = (line[len("export ") :] or "").strip()
+            if rest:
+                env_lines.append(_normalize_export_line(rest))
+            continue
+        if line.startswith("COOKIE:"):
+            cookie_value = (line.split("COOKIE:", 1)[1] or "").strip()
+            continue
+        if line.startswith("GET:"):
+            get_value = (line.split("GET:", 1)[1] or "").strip()
+            continue
+        if line.startswith("POST:"):
+            post_value = (line.split("POST:", 1)[1] or "").strip()
+            continue
+    return {"env_lines": env_lines, "COOKIE": cookie_value, "GET": get_value, "POST": post_value}
+
+
+def load_symbolic_solution_defaults(test_command_path: str) -> dict:
+    return _parse_test_command_text(_read_text(test_command_path))
+
+
+def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = None) -> str:
+    sol = solution if isinstance(solution, dict) else {}
+    norm: dict[str, object] = {}
+    for k, v in sol.items():
+        if not isinstance(k, str):
+            continue
+        norm[k.strip().upper()] = v
+    defaults = defaults if isinstance(defaults, dict) else {}
+    env_defaults = defaults.get("env_lines") if isinstance(defaults.get("env_lines"), list) else []
+    env_lines = _normalize_env_lines(
+        norm.get("ENV"),
+        defaults=env_defaults,
+        use_default=("ENV" not in norm),
+    )
+    cookie_value = _normalize_request_field(
+        norm.get("COOKIE"),
+        default_value=str(defaults.get("COOKIE") or ""),
+        use_default=("COOKIE" not in norm),
+    )
+    get_value = _normalize_request_field(
+        norm.get("GET"),
+        default_value=str(defaults.get("GET") or ""),
+        use_default=("GET" not in norm),
+    )
+    post_value = _normalize_request_field(
+        norm.get("POST"),
+        default_value=str(defaults.get("POST") or ""),
+        use_default=("POST" not in norm),
+    )
+    lines: list[str] = []
+    if env_lines:
+        lines.extend(env_lines)
+        lines.append("")
+    lines.append("COOKIE:" + (cookie_value or ""))
+    lines.append("GET:" + (get_value or ""))
+    lines.append("POST:" + (post_value or ""))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_symbolic_solution_outputs(
+    solutions: list[dict],
+    *,
+    output_root: str,
+    seq: int | None = None,
+    defaults: dict | None = None,
+) -> list[str]:
+    if not isinstance(output_root, str) or not output_root.strip():
+        return []
+    solution_dir = os.path.join(output_root, "solution")
+    _ensure_dir(solution_dir)
+    out_paths: list[str] = []
+    for i, sol in enumerate(solutions or [], 1):
+        if not isinstance(sol, dict):
+            continue
+        name = f"solution_{int(seq)}_{i}.txt" if seq is not None else f"solution_{i}.txt"
+        path = os.path.join(solution_dir, name)
+        text = format_symbolic_solution_text(sol, defaults=defaults)
+        _write_text(path, text)
+        out_paths.append(path)
+    return out_paths
+
+
 def build_symbolic_response_example() -> str:
     lines = []
     lines.append("{")

@@ -27,7 +27,15 @@ from taint_handlers import REGISTRY
 from taint_handlers.llm.core.llm_process import process_taints_llm
 from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 from llm_utils.prompts.symbolic_prompt import generate_symbolic_execution_prompt
-from llm_utils.symbolic_runner import build_symbolic_response_example, run_symbolic_prompt, write_symbolic_prompt, write_symbolic_response
+from llm_utils.symbolic_runner import (
+    build_symbolic_response_example,
+    load_symbolic_solution_defaults,
+    parse_symbolic_response,
+    run_symbolic_prompt,
+    write_symbolic_prompt,
+    write_symbolic_response,
+    write_symbolic_solution_outputs,
+)
 
 def _safe_rmtree(p: str) -> None:
     """Best-effort recursive delete for a directory path."""
@@ -75,6 +83,22 @@ def clean_llm_io_dirs(test_dir: str, *, llm_mode: bool, llm_test_mode: bool) -> 
     _safe_rmtree(os.path.join(test_dir, 'llm', 'prompts'))
     if not llm_test_mode:
         _safe_rmtree(os.path.join(test_dir, 'llm', 'responses'))
+
+
+def _resolve_output_root(cfg) -> str:
+    raw = cfg.raw if hasattr(cfg, 'raw') else {}
+    paths = raw.get('paths') if isinstance(raw, dict) else {}
+    output_dir = ''
+    if isinstance(paths, dict):
+        output_dir = paths.get('output_dir') or ''
+    if not output_dir and isinstance(raw, dict):
+        output_dir = raw.get('output_dir') or ''
+    output_dir = (output_dir or 'output').strip()
+    if not output_dir:
+        output_dir = 'output'
+    if os.path.isabs(output_dir):
+        return os.path.abspath(output_dir)
+    return os.path.abspath(os.path.join(cfg.base_dir, output_dir))
  
 def read_trace_line(n, trace_path: str | None = None):
     """Read `trace.log` line N and return a normalized `path:line` locator string."""
@@ -1104,6 +1128,23 @@ def main():
                 out['symbolic_response_path'] = rr.get('response_path')
                 out['symbolic_response_json_path'] = rr.get('response_json_path')
                 logger.info('write_symbolic_prompt', prompt_path=out.get('symbolic_prompt_path'), llm_mode=True, test_mode=False)
+                try:
+                    output_root = _resolve_output_root(cfg)
+                    defaults = load_symbolic_solution_defaults(cfg.find_input_file('测试命令.txt'))
+                    sols = rr.get('response_obj') or []
+                    if not sols and isinstance(out.get('symbolic_response_json_path'), str) and os.path.exists(out.get('symbolic_response_json_path')):
+                        try:
+                            with open(out.get('symbolic_response_json_path'), 'r', encoding='utf-8', errors='replace') as f:
+                                obj = json.load(f)
+                            sols = obj.get('solutions') if isinstance(obj, dict) else []
+                        except Exception:
+                            sols = []
+                    if isinstance(sols, str):
+                        sols = parse_symbolic_response(sols)
+                    wrote = write_symbolic_solution_outputs(sols or [], output_root=output_root, seq=int(n), defaults=defaults)
+                    logger.info('write_symbolic_solutions', count=len(wrote), output_root=output_root)
+                except Exception:
+                    logger.exception('write_symbolic_solutions_failed')
             else:
                 prompt_path = write_symbolic_prompt(prompt_text, run_dir=run_dir, seq=int(n))
                 out['symbolic_prompt_path'] = prompt_path
@@ -1112,6 +1153,21 @@ def main():
                     out['symbolic_response_path'] = raw_path
                     out['symbolic_response_json_path'] = json_path
                 logger.info('write_symbolic_prompt', prompt_path=prompt_path, llm_mode=False, test_mode=bool(test_mode))
+                if test_mode:
+                    try:
+                        output_root = _resolve_output_root(cfg)
+                        defaults = load_symbolic_solution_defaults(cfg.find_input_file('测试命令.txt'))
+                        sols = []
+                        try:
+                            with open(out.get('symbolic_response_json_path', ''), 'r', encoding='utf-8', errors='replace') as f:
+                                obj = json.load(f)
+                            sols = (obj.get('solutions') or []) if isinstance(obj, dict) else []
+                        except Exception:
+                            sols = []
+                        wrote = write_symbolic_solution_outputs(sols or [], output_root=output_root, seq=int(n), defaults=defaults)
+                        logger.info('write_symbolic_solutions', count=len(wrote), output_root=output_root)
+                    except Exception:
+                        logger.exception('write_symbolic_solutions_failed')
         except Exception:
             logger.exception('write_symbolic_prompt_failed')
     return finish(out)

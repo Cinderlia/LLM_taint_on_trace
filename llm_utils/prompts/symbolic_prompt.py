@@ -644,7 +644,7 @@ def generate_symbolic_execution_prompt(
         lines.append(f"{seq_s} | {loc} | {code_s}")
     lines.append("")
     lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
-    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE或GET参数。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分，不需要修改的部分请尽可能保持原样。")
+    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE或GET参数。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分。不需要修改的部分请保持原样，可以不出现在JSON里面。")
     lines.append("仅基于给出的代码和 if 语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
     lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
     lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
