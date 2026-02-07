@@ -30,10 +30,10 @@ _DEFAULT_LLM_TAINT_TEMPLATE_TAIL = (
     "AST_DIM：形如 arr[key]。\n"
     "AST_VAR：单个变量名/标识符（可能带$前缀）。\n"
     "当你输出AST_METHOD_CALL或AST_CALL时，如果该调用的参数中包含AST_VAR/AST_PROP/AST_DIM/AST_METHOD_CALL/AST_CALL，也必须把每个参数作为单独的taint输出，并添加一条数据流边：参数 -> 该调用节点。\n"
-    "请同时输出数据流的有向边（dataflow edges），方向为：影响者 -> 被影响者。仅在有数据传递的时候输出有向边，不要随意输出。\n"
+    "（dataflow edges），方向为：影响者 -> 被影响者。仅在明确有数据传递关系的时候输出有向边，不要随意输出数据流边。\n"
     "所有出现在edges里的节点，都必须出现在taints里（即使它不是新的污点，也要列出来）。\n"
     "如果没有找到新的影响因素，仍然必须输出合法json，确保字段存在。\n"
-    "只输出json，不要输出任何解释性文字或Markdown。\n\n"
+    "必须输出合法的json格式，只输出json，不要输出任何解释性文字或Markdown。\n\n"
     "代码（每行格式为：seq + 源码行）：\n"
     "{result_set}\n\n"
     "输出json格式必须为：\n"
@@ -326,6 +326,58 @@ def ensure_seq_groups_by_loc(ctx):
     return groups_by_loc
 
 
+def _filter_prompt_locs(locs, ctx):
+    if not locs or not isinstance(ctx, dict):
+        return list(locs or [])
+    try:
+        from taint_handlers.handlers.helpers.ast_var_include import (
+            _filter_define_locs_from_include,
+            _filter_func_def_locs_from_include,
+        )
+    except Exception:
+        return list(locs or [])
+    recs = ctx.get('trace_index_records') or []
+    nodes = ctx.get('nodes') or {}
+    children_of = ctx.get('children_of') or {}
+    parent_of = ctx.get('parent_of') or {}
+    def _loc_key(x):
+        if not x:
+            return None
+        if isinstance(x, dict):
+            lk = (x.get('loc') or '').strip()
+            if lk:
+                return lk
+            p = (x.get('path') or '').strip()
+            ln = x.get('line')
+            if p and ln is not None:
+                try:
+                    return f"{p}:{int(ln)}"
+                except Exception:
+                    return None
+            return None
+        if isinstance(x, str):
+            return x
+        return None
+    loc_keys = []
+    for x in locs or []:
+        k = _loc_key(x)
+        if k:
+            loc_keys.append(k)
+    if not loc_keys:
+        return list(locs or [])
+    loc_keys = _filter_func_def_locs_from_include(list(loc_keys), recs, nodes, ctx)
+    loc_keys = _filter_define_locs_from_include(list(loc_keys), recs, nodes, children_of, parent_of, ctx)
+    keep = set(loc_keys)
+    if not keep:
+        return []
+    out = []
+    for x in locs or []:
+        k = _loc_key(x)
+        if k and k in keep:
+            out.append(x)
+    return out
+
+
 def locs_to_seq_code_block(locs, ctx, *, prefer: str = 'forward'):
     """Convert a list of locators into a sorted `seq + source_line` code block string."""
     scope_root = (ctx.get('scope_root') if isinstance(ctx, dict) else None) or '/app'
@@ -335,6 +387,8 @@ def locs_to_seq_code_block(locs, ctx, *, prefer: str = 'forward'):
         ref_seq = ctx.get('input_seq')
     groups_by_loc = ensure_seq_groups_by_loc(ctx)
     preamble_locs = (ctx.get('_llm_scope_preamble_locs') if isinstance(ctx, dict) else None) or []
+    preamble_locs = _filter_prompt_locs(preamble_locs, ctx)
+    locs = _filter_prompt_locs(locs, ctx)
     starts = set()
     ends = set()
     if isinstance(ctx, dict):

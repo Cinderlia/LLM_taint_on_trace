@@ -108,6 +108,30 @@ def _import_switch_branch_utils():
         return infer_switch_choices_for_seqs, build_seq_to_case_label, build_switch_case_result_set_for_seq, insert_mapped_items_after_seq
 
 
+def _import_switch_case_utils():
+    try:
+        from llm_utils.branch.switch_branch import get_switch_case_ids, get_switch_case_line
+        return get_switch_case_ids, get_switch_case_line
+    except Exception:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from llm_utils.branch.switch_branch import get_switch_case_ids, get_switch_case_line
+        return get_switch_case_ids, get_switch_case_line
+
+
+def _import_switch_coverage_utils():
+    try:
+        from if_branch_coverage.switch_coverage import check_switch_branch_coverage
+        return check_switch_branch_coverage
+    except Exception:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from if_branch_coverage.switch_coverage import check_switch_branch_coverage
+        return check_switch_branch_coverage
+
+
 def _import_graph_mapping():
     try:
         from utils.cpg_utils.graph_mapping import load_ast_edges, load_nodes
@@ -130,6 +154,64 @@ def _import_call_scope_utils():
             sys.path.insert(0, root)
         from taint_handlers.handlers.call.ast_method_call import partition_function_scope_for_call
         return partition_function_scope_for_call
+
+
+def _import_scope_filter_utils():
+    try:
+        from taint_handlers.handlers.helpers.ast_var_include import (
+            _filter_define_locs_from_include,
+            _filter_func_def_locs_from_include,
+        )
+        return _filter_define_locs_from_include, _filter_func_def_locs_from_include
+    except Exception:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from taint_handlers.handlers.helpers.ast_var_include import (
+            _filter_define_locs_from_include,
+            _filter_func_def_locs_from_include,
+        )
+        return _filter_define_locs_from_include, _filter_func_def_locs_from_include
+
+
+def _build_switch_case_coverage(
+    switch_ids: list[int],
+    *,
+    nodes: dict[int, dict],
+    children_of: dict[int, list[int]],
+) -> tuple[dict[int, list[dict]], dict[int, dict[int, bool]]]:
+    get_switch_case_ids, get_switch_case_line = _import_switch_case_utils()
+    check_switch_branch_coverage = _import_switch_coverage_utils()
+    line_to_cases: dict[int, list[dict]] = {}
+    switch_to_coverage: dict[int, dict[int, bool]] = {}
+    for sid in switch_ids or []:
+        try:
+            sid_i = int(sid)
+        except Exception:
+            continue
+        cov_raw = check_switch_branch_coverage(int(sid_i))
+        cov_map: dict[int, bool] = {}
+        if isinstance(cov_raw, dict):
+            for k, v in cov_raw.items():
+                try:
+                    ki = int(k)
+                except Exception:
+                    continue
+                cov_map[int(ki)] = bool(v)
+        switch_to_coverage[int(sid_i)] = cov_map
+        for case_id in get_switch_case_ids(int(sid_i), nodes=nodes, children_of=children_of):
+            try:
+                cid_i = int(case_id)
+            except Exception:
+                continue
+            ln = get_switch_case_line(int(cid_i), nodes)
+            if ln is None:
+                continue
+            covered = bool(cov_map.get(int(cid_i))) if cov_map else False
+            line_to_cases.setdefault(int(ln), []).append(
+                {"case_id": int(cid_i), "covered": bool(covered), "switch_id": int(sid_i)}
+            )
+    return line_to_cases, switch_to_coverage
 
 
 def _load_result_set(result_set_or_path):
@@ -577,6 +659,70 @@ def generate_symbolic_execution_prompt(
             )
             mapped = insert_mapped_items_after_seq(mapped or [], after_seq=int(input_seq_i), insert_items=mapped_cases or [])
 
+    switch_case_line_map: dict[int, list[dict]] = {}
+    switch_coverage_summary: dict[int, dict[int, bool]] = {}
+    if have_graph and input_seq_i is not None and nodes and children_of:
+        switch_ids: list[int] = []
+        for sc in switch_choices or []:
+            try:
+                sseq = int(getattr(sc, "switch_seq"))
+                sid = int(getattr(sc, "switch_id"))
+            except Exception:
+                continue
+            if int(sseq) == int(input_seq_i):
+                switch_ids.append(int(sid))
+        if switch_ids:
+            switch_case_line_map, switch_coverage_summary = _build_switch_case_coverage(
+                switch_ids,
+                nodes=nodes,
+                children_of=children_of,
+            )
+
+    if have_graph and mapped:
+        try:
+            _filter_define_locs_from_include, _filter_func_def_locs_from_include = _import_scope_filter_utils()
+            scope_ctx = {
+                "initial_taints": (analysis_obj or {}).get("initial_taints") if isinstance(analysis_obj, dict) else None,
+                "taint_sources": (analysis_obj or {}).get("taint_sources") if isinstance(analysis_obj, dict) else None,
+                "nodes": nodes,
+                "children_of": children_of,
+                "parent_of": parent_of if isinstance(parent_of, dict) else {},
+                "trace_index_records": trace_index_records,
+            }
+            locs = []
+            for it in mapped or []:
+                if not isinstance(it, dict):
+                    continue
+                p = (it.get("path") or "").strip()
+                ln = it.get("line")
+                if not p or ln is None:
+                    continue
+                try:
+                    locs.append(f"{p}:{int(ln)}")
+                except Exception:
+                    continue
+            locs2 = _filter_func_def_locs_from_include(list(locs), trace_index_records, nodes, scope_ctx)
+            locs2 = _filter_define_locs_from_include(locs2, trace_index_records, nodes, children_of, scope_ctx.get("parent_of") or {}, scope_ctx)
+            loc_set = set(locs2)
+            if loc_set:
+                filtered = []
+                for it in mapped or []:
+                    if not isinstance(it, dict):
+                        continue
+                    p = (it.get("path") or "").strip()
+                    ln = it.get("line")
+                    if not p or ln is None:
+                        continue
+                    try:
+                        loc = f"{p}:{int(ln)}"
+                    except Exception:
+                        continue
+                    if loc in loc_set:
+                        filtered.append(it)
+                mapped = filtered
+        except Exception:
+            pass
+
     test_command_path = _resolve_existing_path(
         os.path.join(os.getcwd(), DEFAULT_TEST_COMMAND_PATH),
         fallback=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), DEFAULT_TEST_COMMAND_PATH),
@@ -596,11 +742,23 @@ def generate_symbolic_execution_prompt(
         seq_display = "?"
 
     lines: list[str] = []
-    lines.append(
-        "请你根据代码上下文，严格按照符号执行的一般流程，将"
-        + seq_display
-        + "行的if语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够让代码走向if语句另一个方向的外部输入。if语句的前面标注了当前的分支走向。"
-    )
+    target_stmt = "if语句"
+    if switch_case_line_map:
+        target_stmt = "switch语句"
+    switch_mode = bool(switch_case_line_map)
+    if switch_mode:
+        lines.append(
+            "请你根据代码上下文，严格按照符号执行的一般流程，将"
+            + seq_display
+            + "行的switch语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我能够进入所有未被覆盖到的case分支的外部输入。if语句的前面标注了当前的分支走向。"
+        )
+        lines.append("switch语句：根据case覆盖情况，生成进入未覆盖case的输入，case前标注false代表未覆盖。")
+    else:
+        lines.append(
+            "请你根据代码上下文，严格按照符号执行的一般流程，将"
+            + seq_display
+            + "行的if语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够让代码走向if语句另一个方向的外部输入。if语句的前面标注了当前的分支走向。"
+        )
     lines.append("")
     lines.append("本次执行的环境变量是：")
     if env_block:
@@ -639,8 +797,16 @@ def generate_symbolic_execution_prompt(
         branch_tag = ""
         if seq_i is not None:
             branch_tag = (seq_to_branch.get(int(seq_i)) or "").strip()
+        switch_tag = ""
+        if ln_i is not None:
+            case_entries = switch_case_line_map.get(int(ln_i)) or []
+            if case_entries:
+                covered = bool((case_entries[0] or {}).get("covered"))
+                switch_tag = f"[{str(covered).lower()}] "
         if branch_tag and code_s.lstrip().startswith("if"):
             code_s = f"[{branch_tag}] {code_s}"
+        if switch_tag:
+            code_s = f"{switch_tag}{code_s}"
         lines.append(f"{seq_s} | {loc} | {code_s}")
     lines.append("")
     lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
@@ -648,6 +814,7 @@ def generate_symbolic_execution_prompt(
     lines.append("仅基于给出的代码和 if 语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
     lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
     lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
+    lines.append("如果你认为，无法反转该if语句，或者该if语句的条件表达式无法符号化，请输出空JSON。")
     lines.append("请输出一个JSON文件，示例：")
     lines.append("{")
     lines.append('  "solutions": [')

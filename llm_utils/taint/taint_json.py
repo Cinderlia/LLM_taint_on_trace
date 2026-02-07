@@ -145,3 +145,13 @@ def parse_llm_taint_response(text: str):
         })
     out_seqs = sorted(seq_set)
     return {'taints': out_taints, 'edges': out_edges, 'seqs': out_seqs}
+
+
+def llm_taint_response_has_valid_json(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    raw_obj = _try_load_json(text)
+    if raw_obj is None:
+        js = _extract_json_text(text)
+        raw_obj = _try_load_json(js or '')
+    return isinstance(raw_obj, dict)

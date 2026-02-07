@@ -9,7 +9,7 @@ from if_branch_coverage import check_if_branch_coverage
 
 
 def main():
-    result = check_if_branch_coverage(6540)
+    result = check_if_branch_coverage(6)
     print(result)
 
 

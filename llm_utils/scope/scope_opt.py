@@ -157,6 +157,12 @@ def merge_round_metas_by_scope(metas: list[dict]) -> list[dict]:
             }
             for m in members
         ]
+        if not isinstance(merged.get('call_param_arg_info'), dict):
+            for m in members:
+                info = m.get('call_param_arg_info')
+                if isinstance(info, dict):
+                    merged['call_param_arg_info'] = info
+                    break
         out.append(merged)
     return out
 

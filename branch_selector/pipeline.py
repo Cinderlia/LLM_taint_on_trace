@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import shutil
+from dataclasses import replace
 from typing import Iterable
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +24,7 @@ from llm_utils.taint.taint_llm_calls import LLMCallFailure, chat_text_with_retri
 from branch_selector.core.buffer import PromptBuffer
 from branch_selector.core.config import load_config
 from branch_selector.core.scope_folding import ScopeSubsetFolder
-from branch_selector.prompt.llm_response import parse_llm_response
+from branch_selector.prompt.llm_response import parse_llm_response, llm_response_has_valid_json
 from branch_selector.prompt.prompt_builder import build_prompt, format_section
 from branch_selector.trace.if_scope_expand import expand_if_seq_groups
 from branch_selector.sim.test_simulator import simulate_response, write_prompt_text, write_response_json
@@ -36,6 +37,7 @@ from branch_selector.trace.trace_extract import (
 )
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
 from if_branch_coverage import check_if_branch_coverage
+from if_branch_coverage.switch_coverage import check_switch_branch_coverage
 from utils.cpg_utils.graph_mapping import safe_int
 
 
@@ -61,10 +63,12 @@ def _clear_branch_selector_dir(base_dir: str) -> None:
 def _clear_seq_dirs(base_dir: str) -> None:
     if not os.path.isdir(base_dir):
         return
-    for name in os.listdir(base_dir):
+    seq_root = os.path.join(base_dir, "seqs")
+    root = seq_root if os.path.isdir(seq_root) else base_dir
+    for name in os.listdir(root):
         if not name.startswith("seq_"):
             continue
-        seq_dir = os.path.join(base_dir, name)
+        seq_dir = os.path.join(root, name)
         if not os.path.isdir(seq_dir):
             continue
         _safe_rmtree(seq_dir)
@@ -92,6 +96,20 @@ def _collect_if_ids_in_record(record: dict, nodes: dict, parent_of: dict[int, in
                     break
                 cur = parent_of.get(int(cur))
                 steps += 1
+    return sorted(out)
+
+
+def _collect_switch_ids_in_record(record: dict, nodes: dict) -> list[int]:
+    if not isinstance(record, dict):
+        return []
+    out: set[int] = set()
+    for nid in record.get("node_ids") or []:
+        ni = safe_int(nid)
+        if ni is None:
+            continue
+        tt = ((nodes.get(int(ni)) or {}).get("type") or "").strip()
+        if tt == "AST_SWITCH":
+            out.add(int(ni))
     return sorted(out)
 
 
@@ -139,6 +157,9 @@ def _iter_if_switch_sections(
                     break
         if isinstance(rec, dict):
             if_ids = _collect_if_ids_in_record(rec, nodes, parent_of)
+            switch_ids = _collect_switch_ids_in_record(rec, nodes)
+            skip_due_to_if = False
+            skip_due_to_switch = False
             if if_ids:
                 if logger is not None:
                     logger.info("if_coverage_check_start", seq=int(seq), if_ids=[int(x) for x in if_ids])
@@ -150,9 +171,33 @@ def _iter_if_switch_sections(
                     if not covered:
                         all_covered = False
                 if all_covered:
+                    skip_due_to_if = True
                     if logger is not None:
                         logger.info("if_coverage_skip", seq=int(seq), if_ids=[int(x) for x in if_ids])
-                    continue
+            if switch_ids:
+                if logger is not None:
+                    logger.info("switch_coverage_check_start", seq=int(seq), switch_ids=[int(x) for x in switch_ids])
+                all_switch_covered = True
+                for switch_id in switch_ids:
+                    cov_map = check_switch_branch_coverage(int(switch_id))
+                    covered_all = bool(cov_map) and all(bool(v) for v in cov_map.values())
+                    if logger is not None:
+                        logger.info(
+                            "switch_coverage_check_item",
+                            seq=int(seq),
+                            switch_id=int(switch_id),
+                            covered_all=bool(covered_all),
+                            covered_count=sum(1 for v in (cov_map or {}).values() if bool(v)),
+                            case_count=len(cov_map or {}),
+                        )
+                    if not covered_all:
+                        all_switch_covered = False
+                if all_switch_covered:
+                    skip_due_to_switch = True
+                    if logger is not None:
+                        logger.info("switch_coverage_skip", seq=int(seq), switch_ids=[int(x) for x in switch_ids])
+            if (if_ids and skip_due_to_if and (not switch_ids or skip_due_to_switch)) or (switch_ids and skip_due_to_switch and not if_ids):
+                continue
         rel_seqs = seq_groups.get(seq) or []
         locs = []
         for s in rel_seqs or []:
@@ -224,6 +269,7 @@ async def _flush_buffer(
     prompt_out_dir: str,
     response_out_dir: str,
     llm_client,
+    llm_temperature: float,
     llm_call_index: int,
     analyze_sem: asyncio.Semaphore,
     logger: Logger | None = None,
@@ -268,7 +314,17 @@ async def _flush_buffer(
     except Exception:
         max_attempts = 1
     try:
-        txt = await chat_text_with_retries(client=llm_client, prompt=prompt_text, system=None, max_attempts=max_attempts, call_timeout_s=getattr(llm_client, "timeout_s", None) if llm_client else None, call_index=llm_call_index)
+        txt = await chat_text_with_retries(
+            client=llm_client,
+            prompt=prompt_text,
+            system=None,
+            temperature=llm_temperature,
+            max_attempts=max_attempts,
+            call_timeout_s=getattr(llm_client, "timeout_s", None) if llm_client else None,
+            call_index=llm_call_index,
+            response_validator=llm_response_has_valid_json,
+            response_validator_name='llm_response_has_valid_json',
+        )
     except LLMCallFailure:
         if logger is not None:
             logger.warning("llm_call_failed", prompt_index=llm_call_index)
@@ -284,8 +340,19 @@ async def _flush_buffer(
 
 
 # Summary: Orchestrate config loading, section production, buffering, LLM calls, and analysis execution.
-async def run_pipeline(config_path: str | None = None):
+async def run_pipeline(
+    config_path: str | None = None,
+    *,
+    test_mode_override: bool | None = None,
+    analyze_llm_test_mode_override: bool | None = None,
+):
     cfg = load_config(config_path)
+    if test_mode_override is not None or analyze_llm_test_mode_override is not None:
+        cfg = replace(
+            cfg,
+            test_mode=cfg.test_mode if test_mode_override is None else bool(test_mode_override),
+            analyze_llm_test_mode=cfg.analyze_llm_test_mode if analyze_llm_test_mode_override is None else bool(analyze_llm_test_mode_override),
+        )
     app_cfg = load_app_config(argv=sys.argv[1:])
     base = app_cfg.base_dir
     test_root = app_cfg.test_dir
@@ -375,6 +442,7 @@ async def run_pipeline(config_path: str | None = None):
                         prompt_out_dir=prompt_out_dir,
                         response_out_dir=response_out_dir,
                         llm_client=llm_client,
+                        llm_temperature=cfg.llm_temperature,
                         llm_call_index=(worker_id * 100000 + flush_index),
                         analyze_sem=analyze_sem,
                         logger=logger,
@@ -404,6 +472,7 @@ async def run_pipeline(config_path: str | None = None):
                         prompt_out_dir=prompt_out_dir,
                         response_out_dir=response_out_dir,
                         llm_client=llm_client,
+                        llm_temperature=cfg.llm_temperature,
                         llm_call_index=(worker_id * 100000 + flush_index),
                         analyze_sem=analyze_sem,
                         logger=logger,

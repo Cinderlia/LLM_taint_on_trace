@@ -8,7 +8,12 @@ collects trace locations likely affecting the current variable taint.
 import os
 from common.app_config import load_app_config
 from utils.trace_utils.trace_edges import build_trace_index_records
-from utils.cpg_utils.graph_mapping import build_funcid_to_call_ids, find_nearest_callsite_locator, read_calls_edges_union
+from utils.cpg_utils.graph_mapping import (
+    build_funcid_to_call_ids,
+    find_nearest_callsite_locator,
+    find_nearest_callsite_record,
+    read_calls_edges_union,
+)
 
 _LAST_TRACE_CTX = None
  
@@ -114,7 +119,7 @@ def compress_consecutive(items):
     ctx = _LAST_TRACE_CTX if isinstance(_LAST_TRACE_CTX, dict) else None
     if ctx is not None and out and all(isinstance(x, str) for x in out):
         try:
-            from .ast_var_include import expand_includes_in_locs
+            from ..helpers.ast_var_include import expand_includes_in_locs
 
             extra_locs, _ = expand_includes_in_locs(locs=list(out), ctx=ctx)
             if extra_locs:
@@ -195,7 +200,7 @@ def _filter_scope_locs(locs: list[str], ctx: dict):
     if not locs or not isinstance(ctx, dict):
         return list(locs or [])
     try:
-        from .ast_var_include import _filter_define_locs_from_include, _filter_func_def_locs_from_include
+        from ..helpers.ast_var_include import _filter_define_locs_from_include, _filter_func_def_locs_from_include
     except Exception:
         return list(locs)
     nodes = ctx.get('nodes') or {}
@@ -214,7 +219,7 @@ def _extend_include_scope_from_file_head(*, stop_index: int, funcid: int, ctx: d
         return []
     rec = recs[int(stop_index) - 1] or {}
     try:
-        from .ast_var_include import is_include_record, include_record_funcid
+        from ..helpers.ast_var_include import is_include_record, include_record_funcid
     except Exception:
         return []
     if not is_include_record(rec, nodes):
@@ -343,7 +348,21 @@ def process(taint, ctx):
             funcid_to_call_ids = build_funcid_to_call_ids(calls_edges_union)
             ctx['_llm_funcid_to_call_ids'] = funcid_to_call_ids
         call_ids = funcid_to_call_ids.get(int(funcid)) or set()
-        call_loc = find_nearest_callsite_locator(set(call_ids), recs, stop_index - 1)
+        call_loc = None
+        call_id = None
+        call_seq = None
+        hit = find_nearest_callsite_record(set(call_ids), recs, stop_index - 1)
+        if hit:
+            call_index, call_id, call_loc = hit
+            try:
+                rec_call = recs[int(call_index)] or {}
+                seqs = rec_call.get('seqs') or []
+                if seqs:
+                    call_seq = int(min(int(x) for x in seqs))
+            except Exception:
+                call_seq = None
+        if call_loc is None:
+            call_loc = find_nearest_callsite_locator(set(call_ids), recs, stop_index - 1)
         preamble = []
         if call_loc:
             preamble.append(call_loc)
@@ -353,8 +372,21 @@ def process(taint, ctx):
             ctx.setdefault('_llm_scope_preamble_by_key', {})[(int(nid), int(seq))] = preamble
         if call_loc:
             step['callsite_loc'] = call_loc
+        if call_id is not None:
+            step['callsite_id'] = int(call_id)
+        if call_seq is not None:
+            step['callsite_seq'] = int(call_seq)
         if stop_loc:
             step['func_def_loc'] = stop_loc
+        if call_id is not None and call_seq is not None and ctx.get('llm_enabled'):
+            try:
+                from taint_handlers.handlers.call import ast_method_call
+            except Exception:
+                ast_method_call = None
+            if ast_method_call is not None:
+                info = ast_method_call.build_call_param_arg_info(call_id, call_seq, funcid, ctx)
+                if info is not None:
+                    ctx['_llm_call_param_arg_info'] = info
 
     results = compress_consecutive(results)
     step['results_count'] = len(results)

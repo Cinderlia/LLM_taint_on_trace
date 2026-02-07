@@ -18,6 +18,7 @@ class AppConfig:
     input_dir: str
     tmp_dir: str
     test_dir: str
+    output_dir: str
     raw: dict[str, Any]
 
     def input_path(self, *parts: str) -> str:
@@ -28,6 +29,9 @@ class AppConfig:
 
     def test_path(self, *parts: str) -> str:
         return os.path.join(self.test_dir, *parts)
+
+    def output_path(self, *parts: str) -> str:
+        return os.path.join(self.output_dir, *parts)
 
     def find_input_file(self, name: str) -> str:
         c1 = self.input_path(name)
@@ -96,10 +100,12 @@ def load_app_config(*, config_path: str | None = None, argv: list[str] | None = 
     input_dir = _parse_kv_arg(args, "--input-dir") or (paths.get("input_dir") if isinstance(paths, dict) else None) or raw.get("input_dir") or "input"
     tmp_dir = _parse_kv_arg(args, "--tmp-dir") or (paths.get("tmp_dir") if isinstance(paths, dict) else None) or raw.get("tmp_dir") or "tmp"
     test_dir = _parse_kv_arg(args, "--test-dir") or (paths.get("test_dir") if isinstance(paths, dict) else None) or raw.get("test_dir") or "test"
+    output_dir = _parse_kv_arg(args, "--output-dir") or (paths.get("output_dir") if isinstance(paths, dict) else None) or raw.get("output_dir") or "output"
 
     input_abs = _abspath(base, str(input_dir))
     tmp_abs = _abspath(base, str(tmp_dir))
     test_abs = _abspath(base, str(test_dir))
+    output_abs = _abspath(base, str(output_dir))
 
     return AppConfig(
         base_dir=base,
@@ -107,5 +113,6 @@ def load_app_config(*, config_path: str | None = None, argv: list[str] | None = 
         input_dir=input_abs,
         tmp_dir=tmp_abs,
         test_dir=test_abs,
+        output_dir=output_abs,
         raw=raw,
     )

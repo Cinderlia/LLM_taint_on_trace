@@ -24,6 +24,13 @@ from ..utils.llm_loop_utils import (
 
 from ..utils.llm_round_meta import _process_llm_round_meta
 
+def _has_valid_llm_json(text: str) -> bool:
+    try:
+        from llm_utils.taint.taint_json import llm_taint_response_has_valid_json
+        return bool(llm_taint_response_has_valid_json(text))
+    except Exception:
+        return False
+
 
 def _ensure_llm_offline_and_client(ctx: dict, get_default_client):
     llm_offline = ctx.get('llm_offline')
@@ -291,6 +298,7 @@ def _maybe_schedule_llm_call_for_meta(
     nm = meta.get('nm') or ''
     locs = meta.get('locs') or []
     prompt = meta.get('prompt') or ''
+    llm_temperature = ctx.get('llm_temperature') if isinstance(ctx, dict) else None
 
     round_no = 0
     try:
@@ -418,12 +426,15 @@ def _maybe_schedule_llm_call_for_meta(
                 client=client,
                 prompt=prompt,
                 system=None,
+                temperature=llm_temperature,
                 logger=lg,
                 max_attempts=getattr(client, 'max_retries', 3) if client is not None else 3,
                 call_timeout_s=getattr(client, 'timeout_s', None) if client is not None else None,
                 call_index=call_index,
                 taint_type=tt,
                 taint_name=nm,
+                response_validator=_has_valid_llm_json,
+                response_validator_name='_has_valid_llm_json',
             )
         )
         call_metas.append(meta)
@@ -738,8 +749,9 @@ def process_taints_llm(initial, ctx):
                     )
                 except Exception:
                     pass
+            prompt_template = t.get('llm_prompt_template') if isinstance(t, dict) else None
             prompt = render_llm_taint_prompt(
-                template=DEFAULT_LLM_TAINT_TEMPLATE,
+                template=(prompt_template or DEFAULT_LLM_TAINT_TEMPLATE),
                 taint_type=tt,
                 taint_name=nm,
                 result_set=block,
@@ -804,12 +816,11 @@ def process_taints_llm(initial, ctx):
                 'prompt_scope_set': prompt_scope_set,
                 'scope_only_seqs': scope_only_seqs,
             }
-            if (t.get('type') or '').strip() in ('AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL'):
-                call_param_arg_info = ctx.pop('_llm_call_param_arg_info', None) if isinstance(ctx, dict) else None
-                if call_param_arg_info is not None:
-                    meta['call_param_arg_info'] = call_param_arg_info
-                elif lg is not None:
-                    lg.debug('llm_call_param_arg_info_missing', tid=tid, tseq=tseq, taint_type=tt, taint_name=nm)
+            call_param_arg_info = ctx.pop('_llm_call_param_arg_info', None) if isinstance(ctx, dict) else None
+            if call_param_arg_info is not None:
+                meta['call_param_arg_info'] = call_param_arg_info
+            elif lg is not None and (t.get('type') or '').strip() in ('AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL'):
+                lg.debug('llm_call_param_arg_info_missing', tid=tid, tseq=tseq, taint_type=tt, taint_name=nm)
             if (t.get('type') or '').strip() == 'AST_PROP':
                 prop_call_scopes_info = ctx.pop('_llm_prop_call_scopes_info', None) if isinstance(ctx, dict) else None
                 if prop_call_scopes_info is not None:
@@ -890,6 +901,60 @@ def process_taints_llm(initial, ctx):
 
         if fatal_exc is not None:
             round_metas = []
+
+        json_retry_attempts = 3
+        try:
+            json_retry_attempts = int(ctx.get('llm_json_retry_attempts') or 3)
+        except Exception:
+            json_retry_attempts = 3
+        if json_retry_attempts < 1:
+            json_retry_attempts = 1
+        if round_metas and (not ctx.get('llm_offline')) and client is not None:
+            for meta in round_metas:
+                try:
+                    resp_txt = meta.get('resp_txt') or ''
+                except Exception:
+                    resp_txt = ''
+                attempts_left = int(json_retry_attempts)
+                while attempts_left > 0 and (not _has_valid_llm_json(resp_txt)):
+                    try:
+                        if llm_max_calls is not None and int(llm_calls) >= int(llm_max_calls):
+                            break
+                    except Exception:
+                        pass
+                    llm_calls = int(llm_calls) + 1
+                    ctx['_llm_call_count'] = llm_calls
+                    if lg is not None:
+                        try:
+                            lg.warning('llm_json_retry_call', call_index=meta.get('call_index'), attempts_left=attempts_left)
+                        except Exception:
+                            pass
+                    coros = [
+                        chat_text_with_retries(
+                            client=client,
+                            prompt=meta.get('prompt') or '',
+                            system=None,
+                            temperature=llm_temperature,
+                            logger=lg,
+                            max_attempts=getattr(client, 'max_retries', 3) if client is not None else 3,
+                            call_timeout_s=getattr(client, 'timeout_s', None) if client is not None else None,
+                            call_index=meta.get('call_index'),
+                            taint_type=meta.get('tt'),
+                            taint_name=meta.get('nm'),
+                            response_validator=_has_valid_llm_json,
+                            response_validator_name='_has_valid_llm_json',
+                        )
+                    ]
+                    try:
+                        res_list = _run_coros_limited(coros, max_concurrency=1)
+                        new_txt = res_list[0] if res_list else ''
+                        if isinstance(new_txt, BaseException):
+                            break
+                        resp_txt = str(new_txt or '')
+                        meta['resp_txt'] = resp_txt
+                    except Exception:
+                        break
+                    attempts_left -= 1
 
         for meta in round_metas:
             stop_due_to_max_calls = _process_llm_round_meta(

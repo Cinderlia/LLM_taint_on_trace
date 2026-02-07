@@ -12,6 +12,7 @@ import sys
 import json
 import bisect
 import shutil
+import re
 from common.app_config import load_app_config
 from common.logger import Logger
 from utils.extractors.if_extract import (
@@ -27,6 +28,7 @@ from taint_handlers import REGISTRY
 from taint_handlers.llm.core.llm_process import process_taints_llm
 from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 from llm_utils.prompts.symbolic_prompt import generate_symbolic_execution_prompt
+from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines, _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
 from llm_utils.symbolic_runner import (
     build_symbolic_response_example,
     load_symbolic_solution_defaults,
@@ -490,6 +492,98 @@ def build_initial_taints(st, nodes, children_of, parent_of):
         elif c.get('kind') == 'static_call':
             add({'id': c['id'], 'type': 'AST_STATIC_CALL', 'name': c.get('name', '')})
     return filter_method_call_receivers(taints)
+
+IF_LLM_TAINT_TEMPLATE = (
+    "你是一个代码分析助手,请你找出下列代码中"
+    "所有的有可能影响到{name}分支方向的变量和函数调用"
+    + _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
+)
+
+def _if_prompt_name(st, trace_index_path: str, scope_root: str, windows_root: str) -> str:
+    p = st.get('path')
+    ln = st.get('line')
+    seq = st.get('seq')
+    if not p or ln is None or seq is None:
+        return ''
+    loc = {'seq': int(seq), 'path': p, 'line': int(ln), 'loc': f"{p}:{int(ln)}"}
+    try:
+        lines = map_result_set_to_source_lines(scope_root, [loc], trace_index_path=trace_index_path, windows_root=windows_root)
+    except Exception:
+        lines = []
+    for it in lines or []:
+        if it.get('seq') == seq:
+            return (it.get('code') or '').strip()
+    return ''
+
+def build_if_initial_taint(st, nodes, children_of, parent_of, trace_index_path: str, scope_root: str, windows_root: str):
+    inner = build_initial_taints(st, nodes, children_of, parent_of)
+    targets = st.get('targets') or []
+    if_id = targets[0] if targets else None
+    nm = _if_prompt_name(st, trace_index_path, scope_root, windows_root)
+    if not nm:
+        nm = 'if(...)'
+    return [{
+        'id': if_id,
+        'seq': st.get('seq'),
+        'type': 'AST_IF',
+        'name': nm,
+        '_if_inner_taints': inner,
+        'llm_prompt_template': IF_LLM_TAINT_TEMPLATE,
+    }]
+
+def handle_if_taint(t, ctx):
+    inner = t.get('_if_inner_taints') if isinstance(t, dict) else None
+    inner = inner if isinstance(inner, list) else []
+    results = []
+    if isinstance(ctx, dict):
+        rs = ctx.get('result_set')
+        if rs is None:
+            rs = []
+            ctx['result_set'] = rs
+    else:
+        rs = []
+    before = len(rs)
+    for it in inner:
+        if not isinstance(it, dict):
+            continue
+        fn = REGISTRY.get(it.get('type') or '')
+        if not fn:
+            continue
+        res_sets = fn(it, ctx) or []
+        if isinstance(res_sets, (list, tuple)):
+            for x in res_sets:
+                if isinstance(x, dict):
+                    results.append(x)
+        elif isinstance(res_sets, dict):
+            results.append(res_sets)
+    rs = ctx.get('result_set') if isinstance(ctx, dict) else rs
+    after = len(rs) if isinstance(rs, list) else 0
+    if isinstance(rs, list) and after > before:
+        new_items = rs[before:after]
+        seen = set()
+        deduped = []
+        for it in new_items:
+            if isinstance(it, dict):
+                loc = it.get('loc')
+                if not loc:
+                    p = it.get('path')
+                    ln = it.get('line')
+                    if p and ln is not None:
+                        loc = f"{p}:{ln}"
+                key = (loc, it.get('seq'))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(it)
+                continue
+            if isinstance(it, str):
+                key = it
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(it)
+        ctx['result_set'] = rs[:before] + deduped + rs[after:]
+    return results
  
 def extract_if_elements_fast(arg, seq, nodes, children_of, trace_index_records, seq_to_index):
     """Locate `AST_IF_ELEM` nodes for a trace locator and extract relevant descendant nodes."""
@@ -975,37 +1069,135 @@ def _parse_analyze_flags_from_config(cfg_raw: dict) -> dict:
     prompt_mode = bool(sec.get('prompt'))
     return {'test': test_mode, 'debug': debug_mode, 'prompt': prompt_mode}
 
-def main():
-    """CLI entrypoint: `python analyze_if_line.py <seq> [--debug] [--llm|--llm-test] [--llm-max=N]`."""
-    if len(sys.argv) < 2:
-        return
-    s = sys.argv[1]
-    cfg = load_app_config(argv=sys.argv[2:])
-    opts = parse_cli_args(sys.argv[2:])
-    cfg_flags = _parse_analyze_flags_from_config(cfg.raw if hasattr(cfg, 'raw') else {})
-    debug_mode = bool(opts.get('debug_mode') or cfg_flags.get('debug'))
-    prompt_mode = bool(opts.get('prompt_mode') or cfg_flags.get('prompt'))
-    test_mode = bool(opts.get('llm_test_mode') or cfg_flags.get('test'))
-    llm_enabled = bool(opts.get('llm_mode') or test_mode)
-    llm_max_calls = opts.get('llm_max_calls')
+
+def _parse_analyze_llm_temperature_from_config(cfg_raw: dict) -> float:
+    if not isinstance(cfg_raw, dict):
+        return 0.3
+    sec = cfg_raw.get('analyze_if')
+    if not isinstance(sec, dict):
+        sec = cfg_raw.get('analyze_if_line')
+    if not isinstance(sec, dict):
+        sec = {}
+    v = sec.get('llm_temperature')
     try:
-        n = int(s)
-    except:
-        return
-    base = cfg.base_dir
+        return float(v) if v is not None else 0.3
+    except Exception:
+        return 0.3
+
+def _parse_retry_counts_from_config(cfg_raw: dict) -> dict:
+    if not isinstance(cfg_raw, dict):
+        return {'llm_json_retry_attempts': 3, 'symbolic_prompt_retry_attempts': 1}
+    sec = cfg_raw.get('analyze_if')
+    if not isinstance(sec, dict):
+        sec = cfg_raw.get('analyze_if_line')
+    if not isinstance(sec, dict):
+        sec = {}
+    a = sec.get('llm_json_retry_attempts')
+    b = sec.get('symbolic_prompt_retry_attempts')
+    try:
+        ai = int(a) if a is not None else 3
+    except Exception:
+        ai = 3
+    try:
+        bi = int(b) if b is not None else 1
+    except Exception:
+        bi = 1
+    return {'llm_json_retry_attempts': max(1, ai), 'symbolic_prompt_retry_attempts': max(0, bi)}
+
+def _extract_json_text(text: str) -> str | None:
+    if not isinstance(text, str):
+        return None
+    t = (text or '').strip()
+    if not t:
+        return None
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
+    if m:
+        inner = (m.group(1) or '').strip()
+        if inner.startswith('{') and inner.endswith('}'):
+            return inner
+    i = t.find('{')
+    j = t.rfind('}')
+    if i >= 0 and j >= 0 and j > i:
+        return t[i : j + 1]
+    return None
+
+def _read_text(path: str) -> str:
+    if not isinstance(path, str) or not path:
+        return ''
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except Exception:
+        return ''
+
+def _llm_response_has_valid_json(run_dir: str, seq: int) -> bool:
+    resp_dir = os.path.join(run_dir, 'symbolic', 'responses')
+    raw_resp_path = os.path.join(resp_dir, f'symbolic_response_{int(seq)}.txt')
+    raw = _read_text(raw_resp_path)
+    js = _extract_json_text(raw)
+    if not js:
+        return False
+    try:
+        json.loads(js)
+        return True
+    except Exception:
+        return False
+
+def _symbolic_response_json_is_empty(run_dir: str, seq: int) -> bool:
+    resp_dir = os.path.join(run_dir, 'symbolic', 'responses')
+    json_resp_path = os.path.join(resp_dir, f'symbolic_response_{int(seq)}.json')
+    try:
+        with open(json_resp_path, 'r', encoding='utf-8', errors='replace') as f:
+            obj = json.load(f)
+        sols = obj.get('solutions') if isinstance(obj, dict) else []
+        return not bool(sols)
+    except Exception:
+        return True
+
+def _run_symbolic_with_json_retry(prompt_text: str, *, run_dir: str, seq: int, logger, attempts: int) -> dict:
+    tries = max(1, int(attempts or 1))
+    last = {}
+    for i in range(tries):
+        rr = run_symbolic_prompt(
+            prompt_text,
+            run_dir=run_dir,
+            seq=int(seq),
+            llm_offline=False,
+            logger=logger,
+        )
+        last = rr if isinstance(rr, dict) else {}
+        ok = _llm_response_has_valid_json(run_dir, int(seq))
+        if ok:
+            break
+    return last
+
+def _run_analyze_once(
+    *,
+    n: int,
+    cfg,
+    opts: dict,
+    debug_mode: bool,
+    prompt_mode: bool,
+    test_mode: bool,
+    llm_enabled: bool,
+    llm_max_calls,
+    llm_temperature: float,
+    retry_cfg: dict,
+) -> tuple[dict, bool]:
     test_root = cfg.test_dir
-    os.makedirs(test_root, exist_ok=True)
-    run_dir = os.path.join(test_root, f"seq_{int(n)}")
+    seq_root = os.path.join(test_root, "seqs")
+    os.makedirs(seq_root, exist_ok=True)
+    run_dir = os.path.join(seq_root, f"seq_{int(n)}")
     clean_previous_test_outputs(run_dir, n)
     clean_llm_io_dirs(run_dir, llm_mode=llm_enabled, llm_test_mode=test_mode)
     logger = Logger(base_dir=run_dir, min_level=('DEBUG' if debug_mode else 'INFO'), name=f'analyze_if_line:{n}', also_console=True)
     out_path = os.path.join(run_dir, f"analysis_output_{n}.json")
-    def finish(obj):
+    def finish(obj, *, symbolic_empty: bool = False):
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
         logger.info('write_output', out_path=out_path)
         logger.close()
-        return
+        return obj, bool(symbolic_empty)
 
     trace_path = cfg.find_input_file('trace.log')
     arg = read_trace_line(n, trace_path)
@@ -1035,7 +1227,16 @@ def main():
         return finish({'error': 'if_elem_not_found_for_trace_line'})
 
     st['seq'] = n
-    initial = build_initial_taints(st, nodes, children_of, parent_of)
+    REGISTRY['AST_IF'] = handle_if_taint
+    initial = build_if_initial_taint(
+        st,
+        nodes,
+        children_of,
+        parent_of,
+        trace_index_path=trace_index_path,
+        scope_root='/app',
+        windows_root=r'D:\files\witcher\app',
+    )
 
     ctx = {
         'input_seq': n,
@@ -1059,7 +1260,9 @@ def main():
         'llm_enabled': llm_enabled,
         'llm_max_calls': (llm_max_calls if llm_enabled else None),
         'llm_offline': (True if test_mode else False) if llm_enabled else None,
+        'llm_temperature': llm_temperature,
         'llm_scope_debug': bool(debug_mode),
+        'llm_json_retry_attempts': int(retry_cfg.get('llm_json_retry_attempts') or 3),
         'debug': {},
         'logger': logger,
         'test_dir': run_dir,
@@ -1104,6 +1307,7 @@ def main():
         logger.write_json('logs', 'debug_ctx.json', {'ast_method_call': (ctx.get('debug') or {}).get('ast_method_call')})
     except Exception:
         pass
+    symbolic_empty = False
     if prompt_mode:
         try:
             prompt_text = generate_symbolic_execution_prompt(
@@ -1117,12 +1321,12 @@ def main():
                 base_prompt=None,
             )
             if bool(opts.get('llm_mode')) and not test_mode:
-                rr = run_symbolic_prompt(
+                rr = _run_symbolic_with_json_retry(
                     prompt_text,
                     run_dir=run_dir,
                     seq=int(n),
-                    llm_offline=False,
                     logger=logger,
+                    attempts=int(retry_cfg.get('llm_json_retry_attempts') or 3),
                 )
                 out['symbolic_prompt_path'] = rr.get('prompt_path')
                 out['symbolic_response_path'] = rr.get('response_path')
@@ -1145,6 +1349,7 @@ def main():
                     logger.info('write_symbolic_solutions', count=len(wrote), output_root=output_root)
                 except Exception:
                     logger.exception('write_symbolic_solutions_failed')
+                symbolic_empty = _symbolic_response_json_is_empty(run_dir, int(n))
             else:
                 prompt_path = write_symbolic_prompt(prompt_text, run_dir=run_dir, seq=int(n))
                 out['symbolic_prompt_path'] = prompt_path
@@ -1170,7 +1375,45 @@ def main():
                         logger.exception('write_symbolic_solutions_failed')
         except Exception:
             logger.exception('write_symbolic_prompt_failed')
-    return finish(out)
+    return finish(out, symbolic_empty=symbolic_empty)
+
+def main():
+    """CLI entrypoint: `python analyze_if_line.py <seq> [--debug] [--llm|--llm-test] [--llm-max=N]`."""
+    if len(sys.argv) < 2:
+        return
+    s = sys.argv[1]
+    cfg = load_app_config(argv=sys.argv[2:])
+    opts = parse_cli_args(sys.argv[2:])
+    cfg_flags = _parse_analyze_flags_from_config(cfg.raw if hasattr(cfg, 'raw') else {})
+    llm_temperature = _parse_analyze_llm_temperature_from_config(cfg.raw if hasattr(cfg, 'raw') else {})
+    retry_cfg = _parse_retry_counts_from_config(cfg.raw if hasattr(cfg, 'raw') else {})
+    debug_mode = bool(opts.get('debug_mode') or cfg_flags.get('debug'))
+    prompt_mode = bool(opts.get('prompt_mode') or cfg_flags.get('prompt'))
+    test_mode = bool(opts.get('llm_test_mode') or cfg_flags.get('test'))
+    llm_enabled = bool(opts.get('llm_mode') or test_mode)
+    llm_max_calls = opts.get('llm_max_calls')
+    try:
+        n = int(s)
+    except:
+        return
+    retry_times = int(retry_cfg.get('symbolic_prompt_retry_attempts') or 1)
+    total_attempts = 1 + max(0, retry_times)
+    for _ in range(total_attempts):
+        _, symbolic_empty = _run_analyze_once(
+            n=int(n),
+            cfg=cfg,
+            opts=opts,
+            debug_mode=bool(debug_mode),
+            prompt_mode=bool(prompt_mode),
+            test_mode=bool(test_mode),
+            llm_enabled=bool(llm_enabled),
+            llm_max_calls=llm_max_calls,
+            llm_temperature=float(llm_temperature),
+            retry_cfg=retry_cfg,
+        )
+        if not symbolic_empty:
+            break
+    return
 
 if __name__ == '__main__':
     main()

@@ -17,6 +17,7 @@ class BranchSelectorConfig:
     test_mode: bool = True
     analyze_llm_test_mode: bool = True
     llm_max_attempts: int = 0
+    llm_temperature: float = 0.8
     nearest_seq_count: int = 3
     farthest_seq_count: int = 3
     base_prompt: str = ""
@@ -72,6 +73,12 @@ def load_config(config_path: str | None = None) -> BranchSelectorConfig:
     def _get_str(k: str, d: str) -> str:
         v = obj.get(k)
         return str(v).strip() if isinstance(v, str) else d
+    def _get_float(k: str, d: float) -> float:
+        v = obj.get(k)
+        try:
+            return float(v) if v is not None else d
+        except Exception:
+            return d
     return BranchSelectorConfig(
         seq_limit=_get_int("seq_limit", 10000),
         buffer_token_limit=_get_int("buffer_token_limit", 3000),
@@ -80,6 +87,7 @@ def load_config(config_path: str | None = None) -> BranchSelectorConfig:
         test_mode=_get_bool("test_mode", True),
         analyze_llm_test_mode=_get_bool("analyze_llm_test_mode", True),
         llm_max_attempts=_get_int("llm_max_attempts", 0),
+        llm_temperature=_get_float("llm_temperature", 0.8),
         nearest_seq_count=_get_int("nearest_seq_count", 3),
         farthest_seq_count=_get_int("farthest_seq_count", 3),
         base_prompt=_get_str("base_prompt", ""),

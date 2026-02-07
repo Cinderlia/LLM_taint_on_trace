@@ -54,6 +54,19 @@ def parse_llm_response(text: str, logger: Logger | None = None) -> list[list[int
     return []
 
 
+def llm_response_has_valid_json(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    s = text.strip()
+    if not s:
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        return False
+
+
 def build_test_response_from_prompts(prompt_items: Iterable[dict], pick_count: int = 5, logger: Logger | None = None) -> list[list[int]]:
     seqs = []
     for it in prompt_items or []:

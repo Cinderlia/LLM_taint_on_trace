@@ -7,11 +7,28 @@ import json
 import os
 import re
 
+from common.app_config import load_app_config
 from llm_utils import get_default_client
 from llm_utils.taint.taint_llm_calls import chat_text_with_retries
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", flags=re.IGNORECASE)
+
+
+def _load_symbolic_llm_temperature() -> float:
+    try:
+        cfg = load_app_config()
+        raw = cfg.raw if hasattr(cfg, "raw") else {}
+    except Exception:
+        raw = {}
+    sec = raw.get("symbolic_prompt")
+    if not isinstance(sec, dict):
+        sec = {}
+    v = sec.get("llm_temperature")
+    try:
+        return float(v) if v is not None else 0.2
+    except Exception:
+        return 0.2
 
 
 def _ensure_dir(p: str) -> None:
@@ -94,6 +111,22 @@ def parse_symbolic_response(text: str) -> list[dict]:
     return _normalize_solutions(obj)
 
 
+def symbolic_response_has_valid_json(text: str) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        obj = json.loads(text)
+    except Exception:
+        js = _extract_json_text(text)
+        if not js:
+            return False
+        try:
+            obj = json.loads(js)
+        except Exception:
+            return False
+    return isinstance(obj, (dict, list))
+
+
 def _stringify_value(v) -> str:
     if v is None:
         return ""
@@ -140,6 +173,47 @@ def _normalize_export_line(line: str) -> str:
     if v.startswith("export "):
         return v
     return "export " + v
+
+
+def _parse_env_kv(line: str) -> tuple[str, str] | None:
+    v = (line or "").strip()
+    if not v:
+        return None
+    if v.startswith("export "):
+        v = (v[len("export ") :] or "").strip()
+    if "=" not in v:
+        return None
+    k, val = v.split("=", 1)
+    k = (k or "").strip()
+    if not k:
+        return None
+    return k, val
+
+
+def _merge_env_lines(base_lines: list[str], override_lines: list[str]) -> list[str]:
+    if not base_lines and not override_lines:
+        return []
+    out: list[str] = []
+    index: dict[str, int] = {}
+    for line in base_lines or []:
+        kv = _parse_env_kv(line)
+        if not kv:
+            continue
+        k, v = kv
+        index[k] = len(out)
+        out.append(_normalize_export_line(f"{k}={v}"))
+    for line in override_lines or []:
+        kv = _parse_env_kv(line)
+        if not kv:
+            continue
+        k, v = kv
+        norm_line = _normalize_export_line(f"{k}={v}")
+        if k in index:
+            out[index[k]] = norm_line
+        else:
+            index[k] = len(out)
+            out.append(norm_line)
+    return out
 
 
 def _normalize_env_lines(env_obj, *, defaults: list[str] | None = None, use_default: bool = False) -> list[str]:
@@ -244,11 +318,14 @@ def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = Non
         norm[k.strip().upper()] = v
     defaults = defaults if isinstance(defaults, dict) else {}
     env_defaults = defaults.get("env_lines") if isinstance(defaults.get("env_lines"), list) else []
-    env_lines = _normalize_env_lines(
-        norm.get("ENV"),
-        defaults=env_defaults,
-        use_default=("ENV" not in norm),
-    )
+    if "ENV" in norm:
+        llm_env_lines = _normalize_env_lines(norm.get("ENV"), defaults=env_defaults, use_default=False)
+        if len(llm_env_lines) < 3:
+            env_lines = _merge_env_lines(env_defaults, llm_env_lines)
+        else:
+            env_lines = llm_env_lines
+    else:
+        env_lines = list(env_defaults)
     cookie_value = _normalize_request_field(
         norm.get("COOKIE"),
         default_value=str(defaults.get("COOKIE") or ""),
@@ -283,12 +360,17 @@ def write_symbolic_solution_outputs(
 ) -> list[str]:
     if not isinstance(output_root, str) or not output_root.strip():
         return []
+    if not solutions:
+        return []
     solution_dir = os.path.join(output_root, "solution")
-    _ensure_dir(solution_dir)
     out_paths: list[str] = []
+    ensured = False
     for i, sol in enumerate(solutions or [], 1):
         if not isinstance(sol, dict):
             continue
+        if not ensured:
+            _ensure_dir(solution_dir)
+            ensured = True
         name = f"solution_{int(seq)}_{i}.txt" if seq is not None else f"solution_{i}.txt"
         path = os.path.join(solution_dir, name)
         text = format_symbolic_solution_text(sol, defaults=defaults)
@@ -395,9 +477,12 @@ def run_symbolic_prompt(
             client=client,
             prompt=prompt_text,
             system=None,
+            temperature=_load_symbolic_llm_temperature(),
             logger=logger,
             max_attempts=max_attempts,
             call_index=1,
+            response_validator=symbolic_response_has_valid_json,
+            response_validator_name='symbolic_response_has_valid_json',
         )
 
     response_text = asyncio.run(_call())

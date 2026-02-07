@@ -110,9 +110,10 @@ def collect_stmt_list_lines(stmt_list_id: int, *, nodes: dict[int, dict], childr
         if x in seen:
             continue
         seen.add(x)
-        ln = _safe_int((nodes.get(int(x)) or {}).get("lineno"))
-        if ln is not None and ln > 0:
-            out.add(int(ln))
+        if int(x) != int(stmt_list_id):
+            ln = _safe_int((nodes.get(int(x)) or {}).get("lineno"))
+            if ln is not None and ln > 0:
+                out.add(int(ln))
         for c in children_of.get(int(x), []) or []:
             ci = _safe_int(c)
             if ci is not None:

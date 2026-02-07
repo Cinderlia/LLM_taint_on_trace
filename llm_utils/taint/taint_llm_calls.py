@@ -150,6 +150,7 @@ async def chat_text_with_retries(
     client,
     prompt: str,
     system: str | None = None,
+    temperature: float | None = None,
     logger=None,
     max_attempts: int = 3,
     base_delay_s: float = 1.0,
@@ -158,6 +159,8 @@ async def chat_text_with_retries(
     call_index: int | None = None,
     taint_type: str | None = None,
     taint_name: str | None = None,
+    response_validator=None,
+    response_validator_name: str | None = None,
 ) -> str:
     """Call `client.chat_text` with retries, exponential backoff, and optional timeout."""
     if max_attempts < 1:
@@ -166,13 +169,41 @@ async def chat_text_with_retries(
     last_exc: BaseException | None = None
     for attempt in range(1, int(max_attempts) + 1):
         try:
-            coro = asyncio.to_thread(client.chat_text, prompt=prompt, system=system)
+            coro = asyncio.to_thread(client.chat_text, prompt=prompt, system=system, temperature=temperature)
             if call_timeout_s is not None:
                 try:
-                    return await asyncio.wait_for(coro, timeout=float(call_timeout_s))
+                    resp = await asyncio.wait_for(coro, timeout=float(call_timeout_s))
                 except Exception:
                     raise
-            return await coro
+            else:
+                resp = await coro
+            if response_validator is not None:
+                ok = False
+                try:
+                    ok = bool(response_validator(resp))
+                except Exception:
+                    ok = False
+                if not ok:
+                    if logger is not None:
+                        fields = {
+                            'call_index': call_index,
+                            'attempt': attempt,
+                            'max_attempts': max_attempts,
+                            'taint_type': taint_type,
+                            'taint_name': taint_name,
+                            'prompt_chars': len(prompt or ''),
+                            'system_chars': len(system or '') if system else 0,
+                            'call_timeout_s': call_timeout_s,
+                            'validator': response_validator_name or getattr(response_validator, '__name__', None),
+                            'resp_chars': len(resp or ''),
+                        }
+                        fields.update(_client_log_fields(client))
+                        logger.warning('llm_response_invalid_json', **fields)
+                    if attempt < int(max_attempts):
+                        await asyncio.sleep(delay)
+                        delay = max(0.0, delay * float(backoff))
+                        continue
+            return resp
         except Exception as e:
             last_exc = e
             status = _extract_status(e)
