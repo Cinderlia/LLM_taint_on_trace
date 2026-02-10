@@ -582,6 +582,8 @@ def process_taints_llm(initial, ctx):
 
     lg = _get_logger(ctx)
     client = _ensure_llm_offline_and_client(ctx, get_default_client)
+    if isinstance(ctx, dict) and ctx.get('llm_temperature') is None:
+        ctx['llm_temperature'] = 0.0
 
     preA = list(initial)
     preB = []
@@ -909,6 +911,7 @@ def process_taints_llm(initial, ctx):
             json_retry_attempts = 3
         if json_retry_attempts < 1:
             json_retry_attempts = 1
+        llm_temperature = ctx.get('llm_temperature') if isinstance(ctx, dict) else None
         if round_metas and (not ctx.get('llm_offline')) and client is not None:
             for meta in round_metas:
                 try:

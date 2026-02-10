@@ -19,6 +19,7 @@ import sys
 from typing import Any
 
 from common.app_config import load_app_config
+from utils.cpg_utils import trace_index as _trace_index_mod
 
 
 csv.field_size_limit(131072 * 10)
@@ -727,29 +728,12 @@ def build_trace_index_records(trace_path: str, nodes_path: str, limit: int | Non
 
 def load_trace_index_records(index_path: str) -> list[dict] | None:
     """Load `trace_index.json` and return its `records` list (or None)."""
-    if not os.path.exists(index_path):
-        return None
-    with open(index_path, 'r', encoding='utf-8', errors='replace') as f:
-        try:
-            obj = json.load(f)
-        except Exception:
-            return None
-    if isinstance(obj, dict) and isinstance(obj.get('records'), list):
-        return obj.get('records')
-    if isinstance(obj, list):
-        return obj
-    return None
+    return _trace_index_mod.load_trace_index_records(index_path)
 
 
 def save_trace_index_records(index_path: str, records: list[dict], meta: dict | None = None) -> None:
     """Atomically write `trace_index.json` with optional metadata."""
-    out: dict[str, Any] = {'records': records}
-    if isinstance(meta, dict):
-        out['meta'] = meta
-    tmp_path = index_path + '.tmp'
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, index_path)
+    _trace_index_mod.save_trace_index_records(index_path, records, meta)
 
 
 def ensure_trace_edges_csv(base: str) -> bool:

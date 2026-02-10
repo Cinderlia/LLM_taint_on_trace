@@ -5,6 +5,8 @@ Expand IF/SWITCH seq groups by taint-scoping: find nearby trace lines that influ
 import os
 import sys
 import bisect
+import time
+import concurrent.futures
 from typing import Iterable
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -537,6 +539,224 @@ def _select_near_far(
     return sorted(set(near_pick + far_pick))
 
 
+def _precompute_expand_indices(trace_index_records: list[dict], nodes: dict) -> dict:
+    seq_to_index = {}
+    seq_to_loc = {}
+    for rec in trace_index_records or []:
+        idx = rec.get('index')
+        rp = rec.get('path')
+        rl = rec.get('line')
+        for s in rec.get('seqs') or []:
+            try:
+                si = int(s)
+            except Exception:
+                continue
+            if si not in seq_to_index:
+                seq_to_index[si] = int(idx) if idx is not None else 0
+            if si not in seq_to_loc and rp and rl is not None:
+                try:
+                    seq_to_loc[si] = (str(rp), int(rl))
+                except Exception:
+                    continue
+    return {
+        'seq_to_index': seq_to_index,
+        'seq_to_loc': seq_to_loc,
+        'loc_to_records': _build_loc_to_records(trace_index_records),
+        'loc_to_min_seq': _build_loc_to_min_seq(trace_index_records),
+        'loc_to_seqs': build_seqs_by_loc(trace_index_records),
+        'node_to_min_seq': _build_node_to_min_seq(trace_index_records),
+        'funcid_to_path': _build_funcid_to_path(trace_index_records, nodes),
+    }
+
+
+def _expand_one_seq(
+    *,
+    seq: int,
+    rel_seqs: list[int] | None,
+    trace_index_records: list[dict],
+    nodes: dict,
+    parent_of: dict,
+    children_of: dict,
+    trace_path: str,
+    scope_root: str,
+    windows_root: str,
+    nearest_seq_count: int,
+    farthest_seq_count: int,
+    indices: dict,
+) -> tuple[int | None, list[int] | None]:
+    try:
+        seq_i = int(seq)
+    except Exception:
+        return None, None
+    seq_to_index = indices.get('seq_to_index') or {}
+    seq_to_loc = indices.get('seq_to_loc') or {}
+    loc_to_records = indices.get('loc_to_records') or {}
+    loc_to_min_seq = indices.get('loc_to_min_seq') or {}
+    loc_to_seqs = indices.get('loc_to_seqs') or {}
+    node_to_min_seq = indices.get('node_to_min_seq') or {}
+    funcid_to_path = indices.get('funcid_to_path') or {}
+
+    loc = seq_to_loc.get(seq_i)
+    if loc is not None:
+        arg = f"{loc[0]}:{int(loc[1])}"
+    else:
+        arg = read_trace_line(seq_i, trace_path)
+    if not arg:
+        return seq_i, list(rel_seqs or []) or [seq_i]
+    st = extract_if_elements_fast(arg, seq_i, nodes, children_of, trace_index_records, seq_to_index)
+    if not (st.get('targets') or []):
+        return seq_i, list(rel_seqs or []) or [seq_i]
+    st['seq'] = seq_i
+    taints = build_initial_taints(st, nodes, children_of, parent_of)
+    if not taints:
+        return seq_i, list(rel_seqs or []) or [seq_i]
+    base_ctx = _build_ctx_for_seq(
+        seq=seq_i,
+        st=st,
+        nodes=nodes,
+        parent_of=parent_of,
+        children_of=children_of,
+        trace_index_records=trace_index_records,
+        seq_to_index=seq_to_index,
+        scope_root=scope_root,
+        windows_root=windows_root,
+    )
+    seq_set = {seq_i}
+    extra_scope_locs = []
+    for nid in st.get('targets') or []:
+        try:
+            nid_i = int(nid)
+        except Exception:
+            continue
+        funcid = (nodes.get(nid_i) or {}).get('funcid')
+        if funcid is None:
+            continue
+        try:
+            funcid_i = int(funcid)
+        except Exception:
+            continue
+        ftype = ((nodes.get(int(funcid_i)) or {}).get('type') or '').strip()
+        if ftype not in ('AST_METHOD', 'AST_FUNC_DECL'):
+            continue
+        func_line = (nodes.get(int(funcid_i)) or {}).get('lineno')
+        func_path = funcid_to_path.get(int(funcid_i))
+        if func_path and func_line is not None:
+            func_seq = None
+            key = _loc_key(func_path, func_line)
+            if key is not None:
+                seqs = loc_to_seqs.get(key) or []
+                if seqs:
+                    pos = bisect.bisect_left(seqs, int(seq_i))
+                    if pos <= 0:
+                        func_seq = int(seqs[0])
+                    elif pos >= len(seqs):
+                        func_seq = int(seqs[-1])
+                    else:
+                        left = int(seqs[pos - 1])
+                        right = int(seqs[pos])
+                        func_seq = left if (int(seq_i) - left) <= (right - int(seq_i)) else right
+            if func_seq is None:
+                func_seq = node_to_min_seq.get(int(funcid_i))
+            loc = {'path': str(func_path), 'line': int(func_line)}
+            if func_seq is not None:
+                loc['seq'] = int(func_seq)
+            extra_scope_locs.append(loc)
+            break
+    for t in taints:
+        tt = (t.get('type') or '').strip()
+        if tt not in _ALLOWED_TYPES:
+            continue
+        tn = _taint_name(t)
+        target_parts = set(_split_var_parts(tt, tn))
+        if not target_parts:
+            continue
+        scope_locs = _collect_scope_locs(t, base_ctx)
+        if extra_scope_locs:
+            scope_locs = list(scope_locs or []) + list(extra_scope_locs)
+        matches = _match_scope_nodes(
+            target_parts=target_parts,
+            scope_locs=scope_locs,
+            nodes=nodes,
+            children_of=children_of,
+            loc_to_records=loc_to_records,
+            loc_to_min_seq=loc_to_min_seq,
+        )
+        seq_set.update(matches)
+    rest = [x for x in seq_set if x != seq_i]
+    picked = _select_near_far(
+        rest,
+        ref_seq=seq_i,
+        near_count=nearest_seq_count,
+        far_count=farthest_seq_count,
+    )
+    return seq_i, sorted({seq_i, *picked})
+
+
+def expand_if_seq_groups_stream(
+    *,
+    seq_groups: dict[int, list[int]],
+    trace_index_records: list[dict],
+    nodes: dict,
+    parent_of: dict,
+    children_of: dict,
+    trace_path: str,
+    scope_root: str,
+    windows_root: str,
+    nearest_seq_count: int = 3,
+    farthest_seq_count: int = 3,
+    max_workers: int | None = None,
+    logger = None,
+) -> Iterable[tuple[int, list[int]]]:
+    start_ts = time.perf_counter()
+    items = list(seq_groups.items())
+    total = len(items)
+    if logger is not None:
+        logger.info("expand_if_seq_groups_start", seqs=total)
+    indices = _precompute_expand_indices(trace_index_records, nodes)
+    workers = int(max_workers) if max_workers is not None else int(os.cpu_count() or 4)
+    if workers < 1:
+        workers = 1
+    processed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for seq, rel_seqs in items:
+            futures[ex.submit(
+                _expand_one_seq,
+                seq=seq,
+                rel_seqs=rel_seqs,
+                trace_index_records=trace_index_records,
+                nodes=nodes,
+                parent_of=parent_of,
+                children_of=children_of,
+                trace_path=trace_path,
+                scope_root=scope_root,
+                windows_root=windows_root,
+                nearest_seq_count=nearest_seq_count,
+                farthest_seq_count=farthest_seq_count,
+                indices=indices,
+            )] = (seq, rel_seqs)
+        for fut in concurrent.futures.as_completed(futures):
+            processed += 1
+            try:
+                seq_i, picked = fut.result()
+            except Exception:
+                seq, rel_seqs = futures.get(fut, (None, None))
+                try:
+                    seq_i = int(seq) if seq is not None else None
+                except Exception:
+                    seq_i = None
+                picked = list(rel_seqs or []) or ([seq_i] if seq_i is not None else None)
+            if seq_i is None or picked is None:
+                continue
+            if logger is not None and (processed % 50 == 0 or processed == total):
+                elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+                logger.info("expand_if_seq_groups_progress", processed=processed, total=total, duration_ms=elapsed_ms)
+            yield seq_i, picked
+    if logger is not None:
+        elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+        logger.info("expand_if_seq_groups_done", seqs=total, duration_ms=elapsed_ms)
+
+
 def expand_if_seq_groups(
     *,
     seq_groups: dict[int, list[int]],
@@ -549,120 +769,22 @@ def expand_if_seq_groups(
     windows_root: str,
     nearest_seq_count: int = 3,
     farthest_seq_count: int = 3,
+    logger = None,
 ) -> dict[int, list[int]]:
     """Expand each seed seq by collecting taint scopes and selecting nearby/farthest relevant seqs."""
-    seq_to_index = {}
-    for rec in trace_index_records or []:
-        idx = rec.get('index')
-        for s in rec.get('seqs') or []:
-            try:
-                si = int(s)
-            except Exception:
-                continue
-            if si not in seq_to_index:
-                seq_to_index[si] = int(idx) if idx is not None else 0
-    loc_to_records = _build_loc_to_records(trace_index_records)
-    loc_to_min_seq = _build_loc_to_min_seq(trace_index_records)
-    loc_to_seqs = build_seqs_by_loc(trace_index_records)
-    node_to_min_seq = _build_node_to_min_seq(trace_index_records)
-    funcid_to_path = _build_funcid_to_path(trace_index_records, nodes)
     out: dict[int, list[int]] = {}
-    for seq, rel_seqs in seq_groups.items():
-        try:
-            seq_i = int(seq)
-        except Exception:
-            continue
-        arg = read_trace_line(seq_i, trace_path)
-        if not arg:
-            out[seq_i] = list(rel_seqs or []) or [seq_i]
-            continue
-        st = extract_if_elements_fast(arg, seq_i, nodes, children_of, trace_index_records, seq_to_index)
-        if not (st.get('targets') or []):
-            out[seq_i] = list(rel_seqs or []) or [seq_i]
-            continue
-        st['seq'] = seq_i
-        taints = build_initial_taints(st, nodes, children_of, parent_of)
-        if not taints:
-            out[seq_i] = list(rel_seqs or []) or [seq_i]
-            continue
-        base_ctx = _build_ctx_for_seq(
-            seq=seq_i,
-            st=st,
-            nodes=nodes,
-            parent_of=parent_of,
-            children_of=children_of,
-            trace_index_records=trace_index_records,
-            seq_to_index=seq_to_index,
-            scope_root=scope_root,
-            windows_root=windows_root,
-        )
-        seq_set = {seq_i}
-        extra_scope_locs = []
-        for nid in st.get('targets') or []:
-            try:
-                nid_i = int(nid)
-            except Exception:
-                continue
-            funcid = (nodes.get(nid_i) or {}).get('funcid')
-            if funcid is None:
-                continue
-            try:
-                funcid_i = int(funcid)
-            except Exception:
-                continue
-            ftype = ((nodes.get(int(funcid_i)) or {}).get('type') or '').strip()
-            if ftype not in ('AST_METHOD', 'AST_FUNC_DECL'):
-                continue
-            func_line = (nodes.get(int(funcid_i)) or {}).get('lineno')
-            func_path = funcid_to_path.get(int(funcid_i))
-            if func_path and func_line is not None:
-                func_seq = None
-                key = _loc_key(func_path, func_line)
-                if key is not None:
-                    seqs = loc_to_seqs.get(key) or []
-                    if seqs:
-                        pos = bisect.bisect_left(seqs, int(seq_i))
-                        if pos <= 0:
-                            func_seq = int(seqs[0])
-                        elif pos >= len(seqs):
-                            func_seq = int(seqs[-1])
-                        else:
-                            left = int(seqs[pos - 1])
-                            right = int(seqs[pos])
-                            func_seq = left if (int(seq_i) - left) <= (right - int(seq_i)) else right
-                if func_seq is None:
-                    func_seq = node_to_min_seq.get(int(funcid_i))
-                loc = {'path': str(func_path), 'line': int(func_line)}
-                if func_seq is not None:
-                    loc['seq'] = int(func_seq)
-                extra_scope_locs.append(loc)
-                break
-        for t in taints:
-            tt = (t.get('type') or '').strip()
-            if tt not in _ALLOWED_TYPES:
-                continue
-            tn = _taint_name(t)
-            target_parts = set(_split_var_parts(tt, tn))
-            if not target_parts:
-                continue
-            scope_locs = _collect_scope_locs(t, base_ctx)
-            if extra_scope_locs:
-                scope_locs = list(scope_locs or []) + list(extra_scope_locs)
-            matches = _match_scope_nodes(
-                target_parts=target_parts,
-                scope_locs=scope_locs,
-                nodes=nodes,
-                children_of=children_of,
-                loc_to_records=loc_to_records,
-                loc_to_min_seq=loc_to_min_seq,
-            )
-            seq_set.update(matches)
-        rest = [x for x in seq_set if x != seq_i]
-        picked = _select_near_far(
-            rest,
-            ref_seq=seq_i,
-            near_count=nearest_seq_count,
-            far_count=farthest_seq_count,
-        )
-        out[seq_i] = sorted({seq_i, *picked})
+    for seq_i, rel in expand_if_seq_groups_stream(
+        seq_groups=seq_groups,
+        trace_index_records=trace_index_records,
+        nodes=nodes,
+        parent_of=parent_of,
+        children_of=children_of,
+        trace_path=trace_path,
+        scope_root=scope_root,
+        windows_root=windows_root,
+        nearest_seq_count=nearest_seq_count,
+        farthest_seq_count=farthest_seq_count,
+        logger=logger,
+    ):
+        out[int(seq_i)] = list(rel or [])
     return out

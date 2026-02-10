@@ -38,6 +38,7 @@ from llm_utils.symbolic_runner import (
     write_symbolic_response,
     write_symbolic_solution_outputs,
 )
+from llm_utils.session_validator import validate_and_fix_php_session_text
 
 def _safe_rmtree(p: str) -> None:
     """Best-effort recursive delete for a directory path."""
@@ -1139,9 +1140,22 @@ def _llm_response_has_valid_json(run_dir: str, seq: int) -> bool:
         return False
     try:
         json.loads(js)
-        return True
     except Exception:
         return False
+    sols = parse_symbolic_response(js)
+    for sol in sols or []:
+        if not isinstance(sol, dict):
+            continue
+        sess = sol.get("SESSION")
+        if sess is None:
+            continue
+        sess_s = (sess if isinstance(sess, str) else str(sess)).strip()
+        if not sess_s:
+            continue
+        vr = validate_and_fix_php_session_text(sess_s)
+        if not vr.ok:
+            return False
+    return True
 
 def _symbolic_response_json_is_empty(run_dir: str, seq: int) -> bool:
     resp_dir = os.path.join(run_dir, 'symbolic', 'responses')

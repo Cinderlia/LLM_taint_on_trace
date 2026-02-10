@@ -4,11 +4,10 @@ Infer whether an IF statement took the true or false branch based on trace index
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from utils.cpg_utils.trace_index import load_trace_index_records as _load_trace_index_records
 
 @dataclass(frozen=True)
 class IfDirection:
@@ -31,19 +30,8 @@ def _safe_int(x: Any) -> int | None:
 
 
 def load_trace_index_records(trace_index_path: str) -> list[dict]:
-    if not trace_index_path:
-        return []
-    if not os.path.exists(trace_index_path):
-        return []
-    try:
-        with open(trace_index_path, "r", encoding="utf-8", errors="replace") as f:
-            obj = json.load(f)
-    except Exception:
-        return []
-    if isinstance(obj, dict):
-        recs = obj.get("records")
-        return recs if isinstance(recs, list) else []
-    return obj if isinstance(obj, list) else []
+    recs = _load_trace_index_records(trace_index_path)
+    return recs if isinstance(recs, list) else []
 
 
 def build_seq_to_record(trace_index_records: Iterable[dict]) -> dict[int, dict]:

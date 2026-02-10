@@ -16,6 +16,7 @@ Provides utilities to:
 import csv
 import os
 import json
+import threading
 
 
 def norm_trace_path(p):
@@ -37,6 +38,29 @@ def norm_nodes_path(p):
 
 
 _FCALL_END_TOKEN = 'op=ZEND_EXT_FCALL_END'
+_TRACE_INDEX_CACHE: dict[str, list[dict]] = {}
+_TRACE_INDEX_CACHE_LOCK = threading.Lock()
+
+
+def _trace_index_cache_key(index_path: str) -> str:
+    return os.path.abspath(index_path) if index_path else ''
+
+
+def _get_cached_trace_index_records(index_path: str) -> list[dict] | None:
+    key = _trace_index_cache_key(index_path)
+    if not key:
+        return None
+    with _TRACE_INDEX_CACHE_LOCK:
+        recs = _TRACE_INDEX_CACHE.get(key)
+        return list(recs) if isinstance(recs, list) else None
+
+
+def _set_cached_trace_index_records(index_path: str, records: list[dict]) -> None:
+    key = _trace_index_cache_key(index_path)
+    if not key:
+        return
+    with _TRACE_INDEX_CACHE_LOCK:
+        _TRACE_INDEX_CACHE[key] = list(records or [])
 
 
 def _merge_fcall_end_groups(groups):
@@ -147,6 +171,9 @@ def build_trace_index_records(trace_path, nodes_path, limit=None):
 
 def load_trace_index_records(index_path):
     """Load `trace_index.json` and return its `records` list (or None)."""
+    cached = _get_cached_trace_index_records(index_path)
+    if cached is not None:
+        return cached
     if not os.path.exists(index_path):
         return None
     with open(index_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -155,8 +182,11 @@ def load_trace_index_records(index_path):
         except Exception:
             return None
     if isinstance(obj, dict) and isinstance(obj.get('records'), list):
-        return obj.get('records')
+        recs = obj.get('records')
+        _set_cached_trace_index_records(index_path, recs)
+        return recs
     if isinstance(obj, list):
+        _set_cached_trace_index_records(index_path, obj)
         return obj
     return None
 
@@ -170,6 +200,7 @@ def save_trace_index_records(index_path, records, meta=None):
     with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, index_path)
+    _set_cached_trace_index_records(index_path, records)
 
 
 def build_nodes_index(nodes_path, target):

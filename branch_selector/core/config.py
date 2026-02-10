@@ -14,6 +14,8 @@ class BranchSelectorConfig:
     buffer_token_limit: int = 3000
     buffer_count: int = 1
     max_analyze_concurrency: int = 5
+    log_level: str = "INFO"
+    if_branch_cache_skip: bool = False
     test_mode: bool = True
     analyze_llm_test_mode: bool = True
     llm_max_attempts: int = 0
@@ -84,6 +86,8 @@ def load_config(config_path: str | None = None) -> BranchSelectorConfig:
         buffer_token_limit=_get_int("buffer_token_limit", 3000),
         buffer_count=_get_int("buffer_count", 1),
         max_analyze_concurrency=_get_int("max_analyze_concurrency", 5),
+        log_level=_get_str("log_level", "INFO"),
+        if_branch_cache_skip=_get_bool("if_branch_cache_skip", False),
         test_mode=_get_bool("test_mode", True),
         analyze_llm_test_mode=_get_bool("analyze_llm_test_mode", True),
         llm_max_attempts=_get_int("llm_max_attempts", 0),

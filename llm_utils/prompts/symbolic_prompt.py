@@ -62,6 +62,21 @@ def _extract_test_command_fields(test_command_text: str) -> tuple[list[str], dic
     return env_lines, {"COOKIE": cookie_value, "GET": get_value, "POST": post_value, "SEED": seed_value}
 
 
+def _filter_env_lines(env_lines: list[str], *, hidden_keys: set[str]) -> list[str]:
+    out: list[str] = []
+    for raw in env_lines or []:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if line.lower().startswith("export "):
+            line = (line[len("export ") :] or "").strip()
+        key = (line.split("=", 1)[0] or "").strip().upper()
+        if key and key in hidden_keys:
+            continue
+        out.append(line)
+    return out
+
+
 def _import_prompt_utils():
     try:
         from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
@@ -729,6 +744,10 @@ def generate_symbolic_execution_prompt(
     )
     test_command_text = _read_text(test_command_path)
     env_lines, req_fields = _extract_test_command_fields(test_command_text)
+    env_lines = _filter_env_lines(
+        env_lines,
+        hidden_keys={"OPCODE_TRACE", "SCRIPT_FILENAME", "LOGIN_COOKIE", "SCRIPT_NAME"},
+    )
     env_block = "\n".join(env_lines).strip()
     cookie_block = ((req_fields.get("COOKIE") or "").strip() if isinstance(req_fields, dict) else "")
     get_block = ((req_fields.get("GET") or "").strip() if isinstance(req_fields, dict) else "")
@@ -753,12 +772,23 @@ def generate_symbolic_execution_prompt(
             + "行的switch语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我能够进入所有未被覆盖到的case分支的外部输入。if语句的前面标注了当前的分支走向。"
         )
         lines.append("switch语句：根据case覆盖情况，生成进入未覆盖case的输入，case前标注false代表未覆盖。")
+        lines.append(
+            "仅修改"
+            + seq_display
+            + "行的switch语句，在此基础上，尽可能让其他所有分支的方向保持不变。"
+        )
     else:
         lines.append(
             "请你根据代码上下文，严格按照符号执行的一般流程，将"
             + seq_display
             + "行的if语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够让代码走向if语句另一个方向的外部输入。if语句的前面标注了当前的分支走向。"
         )
+        lines.append(
+            "仅反转"
+            + seq_display
+            + "行的if语句，在此基础上，尽可能让其他所有分支的方向保持不变。"
+        )
+
     lines.append("")
     lines.append("本次执行的环境变量是：")
     if env_block:
@@ -768,6 +798,7 @@ def generate_symbolic_execution_prompt(
     lines.append("COOKIE:" + cookie_block)
     lines.append("GET:" + get_block)
     lines.append("POST:" + post_block)
+    lines.append("SESSION:")
     if seed_block and (not cookie_block and not get_block and not post_block):
         lines.append("SEED:")
         lines.append(seed_block)
@@ -810,10 +841,12 @@ def generate_symbolic_execution_prompt(
         lines.append(f"{seq_s} | {loc} | {code_s}")
     lines.append("")
     lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
-    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE或GET参数。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分。不需要修改的部分请保持原样，可以不出现在JSON里面。")
+    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE、GET、SESSION参数（对应 JSON 字段：ENV/POST/COOKIE/GET/SESSION）。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分。不需要修改的部分请保持原样，可以不出现在JSON里面。")
+    lines.append("如果需要修改SESSION参数，请在JSON的 SESSION 字段中直接输出合法的SESSION文件内容（即 session 文件的原始文本内容，而不是再包一层 JSON）。")
     lines.append("仅基于给出的代码和 if 语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
     lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
     lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
+    lines.append("如果决定该if语句方向的变量不是来自上述五种输入（环境变量、COOKIE、POST、GET、SESSION），则认为无法修改。")
     lines.append("如果你认为，无法反转该if语句，或者该if语句的条件表达式无法符号化，请输出空JSON。")
     lines.append("请输出一个JSON文件，示例：")
     lines.append("{")
@@ -832,6 +865,9 @@ def generate_symbolic_execution_prompt(
     lines.append('      "ENV": {')
     lines.append('        "METHOD": "GET"')
     lines.append("      }")
+    lines.append("    },")
+    lines.append("    {")
+    lines.append('      "SESSION": "is_admin|b:1;user_id|i:1;"')
     lines.append("    }")
     lines.append("  ]")
     lines.append("}")

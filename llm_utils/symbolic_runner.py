@@ -9,6 +9,7 @@ import re
 
 from common.app_config import load_app_config
 from llm_utils import get_default_client
+from llm_utils.session_validator import validate_and_fix_php_session_text
 from llm_utils.taint.taint_llm_calls import chat_text_with_retries
 
 
@@ -309,7 +310,7 @@ def load_symbolic_solution_defaults(test_command_path: str) -> dict:
     return _parse_test_command_text(_read_text(test_command_path))
 
 
-def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = None) -> str:
+def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = None, seq: int | None = None) -> str:
     sol = solution if isinstance(solution, dict) else {}
     norm: dict[str, object] = {}
     for k, v in sol.items():
@@ -318,15 +319,135 @@ def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = Non
         norm[k.strip().upper()] = v
     defaults = defaults if isinstance(defaults, dict) else {}
     env_defaults = defaults.get("env_lines") if isinstance(defaults.get("env_lines"), list) else []
+    hidden_keys = {"OPCODE_TRACE", "SCRIPT_FILENAME", "LOGIN_COOKIE", "SCRIPT_NAME"}
+    def _shell_single_quote(v: str) -> str:
+        s = v if isinstance(v, str) else ""
+        return "'" + s.replace("'", "'\\''") + "'"
+
+    def _cookie_parts_from_text(text: str) -> list[tuple[str, str | None]]:
+        out: list[tuple[str, str | None]] = []
+        s = (text or "").strip()
+        if not s:
+            return out
+        for raw in re.split(r"[;&]", s):
+            part = (raw or "").strip()
+            if not part:
+                continue
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k2 = (k or "").strip()
+                v2 = (v or "").strip()
+                if k2:
+                    out.append((k2, v2))
+                continue
+            out.append((part, None))
+        return out
+
+    def _cookie_parts_from_obj(obj) -> list[tuple[str, str | None]]:
+        if obj is None:
+            return []
+        if isinstance(obj, dict):
+            out: list[tuple[str, str | None]] = []
+            for k, v in obj.items():
+                ks = (k or "").strip() if isinstance(k, str) else ""
+                if not ks:
+                    continue
+                if v is None:
+                    out.append((ks, None))
+                    continue
+                vs = (v if isinstance(v, str) else _stringify_value(v)).strip()
+                out.append((ks, None if vs == "" else vs))
+            return out
+        if isinstance(obj, (list, tuple)):
+            out: list[tuple[str, str | None]] = []
+            for it in obj:
+                if isinstance(it, dict):
+                    out.extend(_cookie_parts_from_obj(it))
+                    continue
+                if isinstance(it, (list, tuple)) and len(it) >= 2:
+                    k = it[0]
+                    v = it[1]
+                    ks = (k or "").strip() if isinstance(k, str) else ""
+                    if not ks:
+                        continue
+                    if v is None:
+                        out.append((ks, None))
+                        continue
+                    vs = (v if isinstance(v, str) else _stringify_value(v)).strip()
+                    out.append((ks, None if vs == "" else vs))
+                    continue
+                if isinstance(it, str):
+                    out.extend(_cookie_parts_from_text(it))
+                    continue
+            return out
+        if isinstance(obj, str):
+            return _cookie_parts_from_text(obj)
+        return _cookie_parts_from_text(_stringify_value(obj))
+
+    def _cookie_parts_to_text(parts: list[tuple[str, str | None]]) -> str:
+        buf: list[str] = []
+        for k, v in parts or []:
+            ks = (k or "").strip()
+            if not ks:
+                continue
+            if v is None:
+                buf.append(ks)
+            else:
+                buf.append(f"{ks}={v}")
+        return "&".join(buf).strip("&")
+
+    def _normalize_cookie_field(field_obj, *, default_value: str, use_default: bool) -> str:
+        if use_default:
+            return _cookie_parts_to_text(_cookie_parts_from_text(default_value))
+        return _cookie_parts_to_text(_cookie_parts_from_obj(field_obj))
+
+    def _inject_phpsessid(cookie_value: str, session_id: str) -> str:
+        parts = _cookie_parts_from_text(cookie_value or "")
+        out: list[tuple[str, str | None]] = [("PHPSESSID", session_id)]
+        for k, v in parts:
+            if (k or "").strip().upper() == "PHPSESSID":
+                continue
+            out.append((k, v))
+        return _cookie_parts_to_text(out)
+
+    def _stringify_session(v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+
+    def _parse_env_pairs(lines: list[str]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for raw in lines or []:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            k = (s.split("=", 1)[0] or "").strip().upper()
+            v = (s.split("=", 1)[1] if "=" in s else "")
+            if k:
+                out[k] = v
+        return out
     if "ENV" in norm:
         llm_env_lines = _normalize_env_lines(norm.get("ENV"), defaults=env_defaults, use_default=False)
-        if len(llm_env_lines) < 3:
-            env_lines = _merge_env_lines(env_defaults, llm_env_lines)
-        else:
-            env_lines = llm_env_lines
+        base_lines = _merge_env_lines(env_defaults, llm_env_lines)
+        env_map = _parse_env_pairs(base_lines)
+        def_map = _parse_env_pairs(env_defaults)
+        for hk in hidden_keys:
+            if hk in def_map and hk not in env_map:
+                base_lines.append(f"{hk}={def_map.get(hk) or ''}")
+        env_lines = base_lines
     else:
-        env_lines = list(env_defaults)
-    cookie_value = _normalize_request_field(
+        env_map = _parse_env_pairs(env_defaults)
+        base_lines = list(env_defaults)
+        for hk in hidden_keys:
+            if hk in env_map and hk not in { (x.split('=',1)[0] or '').strip().upper() for x in base_lines }:
+                base_lines.append(f"{hk}={env_map.get(hk) or ''}")
+        env_lines = base_lines
+    cookie_value = _normalize_cookie_field(
         norm.get("COOKIE"),
         default_value=str(defaults.get("COOKIE") or ""),
         use_default=("COOKIE" not in norm),
@@ -341,13 +462,29 @@ def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = Non
         default_value=str(defaults.get("POST") or ""),
         use_default=("POST" not in norm),
     )
+    sess_content = ""
+    if "SESSION" in norm and seq is not None:
+        sess_content = _stringify_session(norm.get("SESSION")).strip()
+        if sess_content:
+            session_id = f"sym-{int(seq)}"
+            cookie_value = _inject_phpsessid(cookie_value or "", session_id)
     lines: list[str] = []
     if env_lines:
         lines.extend(env_lines)
         lines.append("")
-    lines.append("COOKIE:" + (cookie_value or ""))
-    lines.append("GET:" + (get_value or ""))
-    lines.append("POST:" + (post_value or ""))
+    seed_cmd = (
+        "printf '%s\\0%s\\0%s' "
+        + _shell_single_quote(cookie_value or "")
+        + " "
+        + _shell_single_quote(get_value or "")
+        + " "
+        + _shell_single_quote(post_value or "")
+        + " > seed"
+    )
+    lines.append(seed_cmd)
+    if sess_content and seq is not None:
+        sess_path = f"/tmp/php_sessions/sess_sym-{int(seq)}"
+        lines.append(f"echo -n {_shell_single_quote(sess_content)} > {sess_path}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -373,7 +510,7 @@ def write_symbolic_solution_outputs(
             ensured = True
         name = f"solution_{int(seq)}_{i}.txt" if seq is not None else f"solution_{i}.txt"
         path = os.path.join(solution_dir, name)
-        text = format_symbolic_solution_text(sol, defaults=defaults)
+        text = format_symbolic_solution_text(sol, defaults=defaults, seq=seq)
         _write_text(path, text)
         out_paths.append(path)
     return out_paths
@@ -418,9 +555,27 @@ def write_symbolic_response(text: str, *, run_dir: str, seq: int) -> tuple[str, 
     json_path = os.path.join(resp_dir, f"symbolic_response_{int(seq)}.json")
     _write_text(raw_path, text)
     solutions = parse_symbolic_response(text)
+    session_ok = True
+    fixed_any = False
+    for sol in solutions or []:
+        if not isinstance(sol, dict):
+            continue
+        sess = sol.get("SESSION")
+        if sess is None:
+            continue
+        sess_s = (sess if isinstance(sess, str) else str(sess)).strip()
+        if not sess_s:
+            continue
+        vr = validate_and_fix_php_session_text(sess_s)
+        if not vr.ok:
+            session_ok = False
+            continue
+        if vr.changed:
+            fixed_any = True
+        sol["SESSION"] = vr.fixed_text
     try:
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({"solutions": solutions}, f, ensure_ascii=False, indent=2)
+            json.dump({"solutions": solutions, "session_ok": session_ok, "session_fixed": fixed_any}, f, ensure_ascii=False, indent=2)
     except Exception:
         _write_text(json_path, "{\n  \"solutions\": []\n}\n")
     return raw_path, json_path
@@ -487,10 +642,19 @@ def run_symbolic_prompt(
 
     response_text = asyncio.run(_call())
     raw_path, json_path = write_symbolic_response(response_text, run_dir=run_dir, seq=int(seq))
+    resp_obj = parse_symbolic_response(response_text)
+    try:
+        if os.path.exists(json_path):
+            with open(json_path, "r", encoding="utf-8", errors="replace") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict) and isinstance(obj.get("solutions"), list):
+                resp_obj = obj.get("solutions") or []
+    except Exception:
+        resp_obj = resp_obj
     return {
         "prompt_path": prompt_path,
         "response_path": raw_path,
         "response_json_path": json_path,
-        "response_obj": parse_symbolic_response(response_text),
+        "response_obj": resp_obj,
         "llm_offline": False,
     }
