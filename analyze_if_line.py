@@ -516,11 +516,39 @@ def _if_prompt_name(st, trace_index_path: str, scope_root: str, windows_root: st
             return (it.get('code') or '').strip()
     return ''
 
+def _extract_if_condition_expr(code_line: str) -> str:
+    s = (code_line or '').strip()
+    if not s:
+        return ''
+    m = re.search(r'(^|[^A-Za-z0-9_])(?:else\s+)?if\s*\(', s)
+    if not m:
+        return ''
+    open_i = s.find('(', m.end() - 1)
+    if open_i < 0:
+        return ''
+    depth = 0
+    close_i = -1
+    for i in range(open_i, len(s)):
+        ch = s[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                close_i = i
+                break
+    if close_i <= open_i:
+        return ''
+    return (s[open_i + 1 : close_i] or '').strip()
+
 def build_if_initial_taint(st, nodes, children_of, parent_of, trace_index_path: str, scope_root: str, windows_root: str):
     inner = build_initial_taints(st, nodes, children_of, parent_of)
     targets = st.get('targets') or []
     if_id = targets[0] if targets else None
     nm = _if_prompt_name(st, trace_index_path, scope_root, windows_root)
+    cond = _extract_if_condition_expr(nm)
+    if cond:
+        nm = cond
     if not nm:
         nm = 'if(...)'
     return [{
@@ -1262,6 +1290,18 @@ def _run_analyze_once(
         return finish({'error': 'if_elem_not_found_for_trace_line'})
 
     st['seq'] = n
+    try:
+        logger.info(
+            'analyze_start',
+            seq=int(n),
+            loc=f"{st.get('path')}:{st.get('line')}",
+            targets=len(st.get('targets') or []),
+            llm_enabled=bool(llm_enabled),
+            llm_test_mode=bool(test_mode),
+            prompt_mode=bool(prompt_mode),
+        )
+    except Exception:
+        pass
     REGISTRY['AST_IF'] = handle_if_taint
     initial = build_if_initial_taint(
         st,
@@ -1313,7 +1353,17 @@ def _run_analyze_once(
     except Exception:
         pass
     try:
+        logger.info('taint_loop_start', llm_enabled=bool(llm_enabled))
         process_taints(initial, ctx)
+        logger.info(
+            'taint_loop_done',
+            llm_enabled=bool(llm_enabled),
+            llm_calls=int(ctx.get('_llm_call_count') or 0) if llm_enabled else 0,
+            llm_new_taints=len(ctx.get('llm_new_taints') or []) if llm_enabled else 0,
+            llm_intermediates=len(ctx.get('llm_intermediates') or []) if llm_enabled else 0,
+            llm_result_seqs=len(ctx.get('llm_result_seqs') or []) if llm_enabled else 0,
+            result_set=len(ctx.get('result_set') or []),
+        )
     except Exception:
         logger.exception('analyze_failed')
         try:
@@ -1333,6 +1383,10 @@ def _run_analyze_once(
         rs = ctx.get('result_set') or []
         rs2 = attach_min_seq_to_result_set(rs, trace_index_records, ref_seq=n, prefer='forward')
         rs2 = sort_dedup_result_set_by_seq(rs2)
+    try:
+        logger.info('result_set_built', count=len(rs2 or []), llm_enabled=bool(llm_enabled))
+    except Exception:
+        pass
     out = {
         'input_seq': n,
         'initial_taints': initial,

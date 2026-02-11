@@ -74,6 +74,7 @@ def _init_meta_debug(meta: dict, parsed: dict, this_obj: str) -> dict:
             'this_call_seq': meta.get('this_call_seq'),
         },
         'llm_taints_raw': parsed.get('taints') or [],
+        'llm_intermediates_raw': parsed.get('intermediates') or [],
         'llm_edges_raw': parsed.get('edges') or [],
         'variants': [],
         'expanded_components': [],
@@ -112,8 +113,8 @@ def _update_llm_scope_tracking(
                 ):
                     llm_scope_set.add(int(this_call_seq))
             elif tt == 'AST_METHOD_CALL':
-                raw_taints = parsed.get('taints') or []
-                for rt in raw_taints:
+                raw_items = (parsed.get('taints') or []) + (parsed.get('intermediates') or [])
+                for rt in raw_items:
                     if not isinstance(rt, dict):
                         continue
                     rtt = (rt.get('type') or '').strip()
@@ -140,6 +141,13 @@ def _add_llm_returned_seqs_to_set(parsed: dict, llm_seqs: set) -> None:
             llm_seqs.add(int(s))
         except Exception:
             pass
+    for it in (parsed.get('taints') or []) + (parsed.get('intermediates') or []):
+        if not isinstance(it, dict):
+            continue
+        try:
+            llm_seqs.add(int(it.get('seq')))
+        except Exception:
+            pass
 
 
 def _log_llm_variants(meta_debug: dict, parsed: dict, ctx: dict, this_obj: str) -> None:
@@ -160,11 +168,44 @@ def _log_llm_variants(meta_debug: dict, parsed: dict, ctx: dict, this_obj: str) 
 
 
 def _map_llm_response(parsed: dict, ctx: dict, this_obj: str) -> tuple[list, list]:
-    from ..core.llm_response import map_llm_edges_to_nodes, map_llm_taints_to_nodes
+    from ..core.llm_response import map_llm_taints_to_nodes
 
-    mapped_nodes = map_llm_taints_to_nodes(parsed.get('taints') or [], ctx, this_obj=this_obj)
-    mapped_edges = map_llm_edges_to_nodes(parsed.get('edges') or [], ctx, this_obj=this_obj)
-    return mapped_nodes, mapped_edges
+    mapped_taints = map_llm_taints_to_nodes(parsed.get('taints') or [], ctx, this_obj=this_obj)
+    mapped_intermediates = map_llm_taints_to_nodes(parsed.get('intermediates') or [], ctx, this_obj=this_obj)
+    return mapped_taints, mapped_intermediates
+
+
+def _append_llm_intermediates(ctx: dict, items: list, this_obj: str) -> None:
+    if not isinstance(ctx, dict) or not isinstance(items, list) or not items:
+        return
+    from ..core.llm_response import _rewrite_this_prefix
+
+    out = ctx.get('llm_intermediates')
+    if not isinstance(out, list):
+        out = []
+        ctx['llm_intermediates'] = out
+    seen = ctx.get('_llm_intermediates_seen')
+    if not isinstance(seen, set):
+        seen = set()
+        ctx['_llm_intermediates_seen'] = seen
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        iid = it.get('id')
+        iseq = it.get('seq')
+        if iid is None or iseq is None:
+            continue
+        try:
+            k = (int(iid), int(iseq), (it.get('type') or '').strip())
+        except Exception:
+            continue
+        if k in seen:
+            continue
+        seen.add(k)
+        rec = dict(it)
+        if this_obj and isinstance(rec.get('name'), str) and rec.get('name'):
+            rec['name'] = _rewrite_this_prefix(rec.get('name') or '', this_obj)
+        out.append(rec)
 
 
 def _update_llm_graph(
@@ -253,8 +294,6 @@ def _select_leaf_nodes(
     calls_edges_union: dict,
     this_obj: str,
 ) -> tuple[list, dict, int, int]:
-    from ..core.llm_response import effective_llm_incoming_sources
-
     leaf_nodes = []
     call_kept = 0
     call_dropped = 0
@@ -264,11 +303,7 @@ def _select_leaf_nodes(
             drop_reason[nk] = 'self'
             continue
         ntt = (nt.get('type') or '').strip()
-        inc_eff = effective_llm_incoming_sources(nt, nk, llm_incoming, ctx)
         if ntt in ('AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL'):
-            if inc_eff:
-                drop_reason[nk] = 'has_incoming_edge'
-                continue
             cid = nt.get('id')
             if cid is None:
                 drop_reason[nk] = 'call_missing_id'
@@ -280,14 +315,6 @@ def _select_leaf_nodes(
             else:
                 call_dropped += 1
                 drop_reason[nk] = 'call_no_calls_edge'
-            continue
-        if inc_eff:
-            nname = (nt.get('name') or '').strip()
-            if (ntt == 'AST_PROP') and this_obj and nname.startswith((this_obj or '').strip().lstrip('$') + '->'):
-                leaf_nodes.append(nt)
-                drop_reason[nk] = 'leaf'
-                continue
-            drop_reason[nk] = 'has_incoming_edge'
             continue
         leaf_nodes.append(nt)
         drop_reason[nk] = 'leaf'
@@ -712,6 +739,46 @@ def _enqueue_leaf_nodes(
                         if eff_this_call_seq is not None and _should_write_this_call_seq(nt, eff_this_obj):
                             nt['_this_call_seq'] = int(eff_this_call_seq)
 
+        if isinstance(call_param_arg_info, list):
+            from taint_handlers import ast_method_call
+
+            for info in call_param_arg_info:
+                if not isinstance(info, dict):
+                    continue
+                repl, dbg = ast_method_call.convert_param_based_taint_to_call_arg_taint(nt, info)
+                if dbg is None:
+                    continue
+                lg = meta.get('_lg')
+                if lg is not None:
+                    try:
+                        lg.debug(
+                            'llm_param_to_arg',
+                            call_id=info.get('call_id'),
+                            call_seq=info.get('call_seq'),
+                            callee_id=info.get('callee_id'),
+                            **dbg,
+                        )
+                    except Exception:
+                        pass
+                if repl is None:
+                    enqueue_dbg['action'] = 'dropped'
+                    enqueue_dbg['reason'] = 'param_to_arg_filtered'
+                    enqueue_dbg['detail'] = dbg
+                    meta_debug['enqueue'].append(enqueue_dbg)
+                    nt = None
+                    break
+                enqueue_dbg['action'] = 'param_to_arg_rewrite'
+                enqueue_dbg['detail'] = dbg
+                nt = repl
+                if eff_this_call_seq is None:
+                    try:
+                        eff_this_call_seq = int(info.get('call_seq'))
+                    except Exception:
+                        eff_this_call_seq = None
+                break
+            if nt is None:
+                continue
+
         if isinstance(call_param_arg_info, dict):
             from taint_handlers import ast_method_call
 
@@ -882,7 +949,7 @@ def _process_llm_round_meta(
     meta = dict(meta)
     meta['this_obj'] = this_obj
     meta['this_call_seq'] = this_call_seq
-    parsed = parse_llm_taint_response(resp_txt) if resp_txt else {'taints': [], 'edges': [], 'seqs': []}
+    parsed = parse_llm_taint_response(resp_txt) if resp_txt else {'taints': [], 'intermediates': [], 'edges': [], 'seqs': []}
     if lg is not None:
         lg.log_json('DEBUG', 'llm_parsed', parsed)
 
@@ -892,20 +959,15 @@ def _process_llm_round_meta(
     _add_llm_returned_seqs_to_set(parsed, llm_seqs)
     _log_llm_variants(meta_debug, parsed, ctx, this_obj)
 
-    mapped_nodes, mapped_edges = _map_llm_response(parsed, ctx, this_obj)
+    mapped_taints, mapped_intermediates = _map_llm_response(parsed, ctx, this_obj)
     if lg is not None:
-        lg.log_json('DEBUG', 'llm_mapped_nodes', mapped_nodes)
-        lg.log_json('DEBUG', 'llm_mapped_edges', mapped_edges)
+        lg.log_json('DEBUG', 'llm_mapped_taints', mapped_taints)
+        lg.log_json('DEBUG', 'llm_mapped_intermediates', mapped_intermediates)
 
-    _update_llm_graph(
-        mapped_edges=mapped_edges,
-        llm_edges=llm_edges,
-        llm_edges_seen=llm_edges_seen,
-        llm_incoming=llm_incoming,
-        this_obj=this_obj,
-    )
+    _append_llm_intermediates(ctx, mapped_intermediates, this_obj)
 
-    candidate = _build_candidate(mapped_nodes, mapped_edges)
+    mapped_edges = []
+    candidate = _build_candidate(mapped_taints, mapped_edges)
     candidate = _expand_candidate_components(candidate, ctx, this_obj, meta_debug)
 
     leaf_nodes, drop_reason, call_kept, call_dropped = _select_leaf_nodes(
@@ -957,7 +1019,7 @@ def _process_llm_round_meta(
             to_queue=('B' if useA else 'A'),
             leaf_count=len(leaf_nodes),
             candidate_count=len(candidate),
-            mapped_nodes_count=len(mapped_nodes),
+            mapped_nodes_count=len(mapped_taints),
             mapped_edges_count=len(mapped_edges),
             call_kept=call_kept,
             call_dropped=call_dropped,

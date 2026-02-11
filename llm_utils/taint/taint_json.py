@@ -49,20 +49,26 @@ def parse_llm_taint_response(text: str):
 
     Output:
     - `taints`: list of `{seq:int, type:str, name:str}` (deduped)
-    - `edges`: list of `{src:{...}, dst:{...}}` (deduped)
-    - `seqs`: sorted list of ints (deduped)
+    - `intermediates`: list of `{seq:int, type:str, name:str}` (deduped)
+    - `edges`: kept for backward-compatibility (always empty)
+    - `seqs`: kept for backward-compatibility (sorted list of ints, deduped)
     """
     raw_obj = _try_load_json(text)
     if raw_obj is None:
         js = _extract_json_text(text)
         raw_obj = _try_load_json(js or '')
     if not isinstance(raw_obj, dict):
-        return {'taints': [], 'edges': [], 'seqs': []}
+        return {'taints': [], 'intermediates': [], 'edges': [], 'seqs': []}
     taints = raw_obj.get('taints')
+    intermediates = raw_obj.get('intermediates')
+    if intermediates is None:
+        intermediates = raw_obj.get('intermediate_vars')
     edges = raw_obj.get('edges')
     seqs = raw_obj.get('seqs')
     if not isinstance(taints, list):
         taints = []
+    if not isinstance(intermediates, list):
+        intermediates = []
     if not isinstance(edges, list):
         edges = []
     if not isinstance(seqs, list):
@@ -80,71 +86,41 @@ def parse_llm_taint_response(text: str):
             seq_set.add(int(it.get('seq')))
         except Exception:
             pass
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
-        src = e.get('src')
-        dst = e.get('dst')
-        if isinstance(src, dict):
-            try:
-                seq_set.add(int(src.get('seq')))
-            except Exception:
-                pass
-        if isinstance(dst, dict):
-            try:
-                seq_set.add(int(dst.get('seq')))
-            except Exception:
-                pass
-
-    out_taints = []
-    seen = set()
-    for it in taints:
+    for it in intermediates:
         if not isinstance(it, dict):
             continue
-        seq = it.get('seq')
-        tt = (it.get('type') or '').strip()
-        nm = (it.get('name') or '').strip()
         try:
-            seq_i = int(seq)
+            seq_set.add(int(it.get('seq')))
         except Exception:
-            continue
-        if not tt or not nm:
-            continue
-        k = (seq_i, tt, nm)
-        if k in seen:
-            continue
-        seen.add(k)
-        out_taints.append({'seq': seq_i, 'type': tt, 'name': nm})
+            pass
+
+    def _norm_items(items: list) -> list[dict]:
+        out = []
+        seen = set()
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            seq = it.get('seq')
+            tt = (it.get('type') or '').strip()
+            nm = (it.get('name') or '').strip()
+            try:
+                seq_i = int(seq)
+            except Exception:
+                continue
+            if not tt or not nm:
+                continue
+            k = (seq_i, tt, nm)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append({'seq': seq_i, 'type': tt, 'name': nm})
+        return out
+
+    out_taints = _norm_items(taints)
+    out_intermediates = _norm_items(intermediates)
     out_edges = []
-    seen_e = set()
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
-        src = e.get('src')
-        dst = e.get('dst')
-        if not isinstance(src, dict) or not isinstance(dst, dict):
-            continue
-        try:
-            src_seq = int(src.get('seq'))
-            dst_seq = int(dst.get('seq'))
-        except Exception:
-            continue
-        src_type = (src.get('type') or '').strip()
-        dst_type = (dst.get('type') or '').strip()
-        src_name = (src.get('name') or '').strip()
-        dst_name = (dst.get('name') or '').strip()
-        if not src_type or not dst_type or not src_name or not dst_name:
-            continue
-        k = (src_seq, src_type, src_name, dst_seq, dst_type, dst_name)
-        if k in seen_e:
-            continue
-        seen_e.add(k)
-        out_edges.append({
-            'src': {'seq': src_seq, 'type': src_type, 'name': src_name},
-            'dst': {'seq': dst_seq, 'type': dst_type, 'name': dst_name},
-        })
     out_seqs = sorted(seq_set)
-    return {'taints': out_taints, 'edges': out_edges, 'seqs': out_seqs}
+    return {'taints': out_taints, 'intermediates': out_intermediates, 'edges': out_edges, 'seqs': out_seqs}
 
 
 def llm_taint_response_has_valid_json(text: str) -> bool:

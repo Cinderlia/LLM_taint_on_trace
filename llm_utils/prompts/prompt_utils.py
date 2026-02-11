@@ -25,15 +25,15 @@ _DEFAULT_LLM_TAINT_TEMPLATE_TAIL = (
     "仅允许输出以下类型：AST_VAR、AST_PROP、AST_DIM、AST_METHOD_CALL、AST_STATIC_CALL、AST_CALL。\n"
     "必须列出所有能够影响到{name}取值的变量和函数调用，不管是直接影响还是间接地影响。\n"
     "还可能通过中间变量间接影响：A = B; {name} = A;\n"
-    "如果是通过中间变量间接影响，请同时输出中间变量和最终影响{name}的所有因素。\n"
+    "如果是通过中间变量间接影响，请把中间变量放入intermediates，同时把最终影响{name}的所有因素放入taints。\n"
     "如果没有找到新的影响因素，仍然必须输出合法json，确保字段存在。\n"
     "必须输出合法的json格式，只输出json，不要输出任何解释性文字或Markdown。\n\n"
     "代码（每行格式为：seq + 源码行）：\n"
     "{result_set}\n\n"
     "输出json格式必须为：\n"
-    "{\"taints\":[{\"seq\":51529,\"type\":\"AST_VAR\",\"name\":\"negate\"}],\"edges\":[{\"src\":{\"seq\":51529,\"type\":\"AST_VAR\",\"name\":\"negate\"},\"dst\":{\"seq\":51573,\"type\":\"AST_VAR\",\"name\":\"ret\"}}],\"seqs\":[51529]}\n"
+    "{\"taints\":[{\"seq\":51529,\"type\":\"AST_VAR\",\"name\":\"negate\"}],\"intermediates\":[{\"seq\":51573,\"type\":\"AST_VAR\",\"name\":\"ret\"}]}\n"
     "如果找不到新污点，输出：\n"
-    "{\"taints\":[],\"edges\":[],\"seqs\":[]}\n"
+    "{\"taints\":[],\"intermediates\":[]}\n"
 )
 
 DEFAULT_LLM_TAINT_TEMPLATE_VAR = (

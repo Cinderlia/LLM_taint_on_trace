@@ -271,6 +271,36 @@ def _find_replay_response_for_round(ctx: dict, *, seq: int, node_id: int, round_
     except Exception:
         pass
     try:
+        prefix = f'round{int(round_no)}-response'
+        want = f'_seq_{int(seq)}_id_'
+        best = None
+        for fn in os.listdir(resp_dir):
+            if not isinstance(fn, str):
+                continue
+            if not fn.startswith(prefix):
+                continue
+            if want not in fn:
+                continue
+            if not fn.endswith('.txt'):
+                continue
+            within = None
+            try:
+                mid = fn[len(prefix) :]
+                if mid.startswith('.'):
+                    mid = mid[1:]
+                mid = mid.split('_seq_', 1)[0]
+                within = int(mid)
+            except Exception:
+                within = None
+            cand = (within if within is not None else 10**9, fn)
+            if best is None or cand < best[0]:
+                best = (cand, fn, within)
+        if best is not None:
+            _, fn, within = best
+            return os.path.join(resp_dir, fn), within
+    except Exception:
+        pass
+    try:
         return _llm_replay_path(ctx, 1, seq=seq, node_id=node_id), None
     except Exception:
         return '', None
@@ -305,53 +335,6 @@ def _maybe_schedule_llm_call_for_meta(
         round_no = int(ctx.get('_llm_round_index') or 0) + 1
     except Exception:
         round_no = 0
-
-    if ctx.get('llm_offline') and round_no > 1 and tid is not None and tseq is not None:
-        rp, within = _find_replay_response_for_round(ctx, seq=int(tseq), node_id=int(tid), round_no=int(round_no))
-        replay_txt = _try_read_text(rp) if rp else None
-        if replay_txt is None:
-            meta['resp_txt'] = ''
-            return llm_calls, False, False
-
-        llm_calls += 1
-        ctx['_llm_call_count'] = llm_calls
-        call_index = llm_calls
-        meta['call_index'] = call_index
-
-        if within is None:
-            try:
-                within = int(ctx.get('_llm_round_prompt_counter') or 0) + 1
-            except Exception:
-                within = 1
-        try:
-            cur_ctr = int(ctx.get('_llm_round_prompt_counter') or 0)
-        except Exception:
-            cur_ctr = 0
-        ctx['_llm_round_prompt_counter'] = max(cur_ctr, int(within))
-        meta['round_no'] = int(round_no)
-        meta['round_prompt_index'] = int(within)
-
-        if lg is not None:
-            lg.info(
-                'llm_call',
-                call_index=call_index,
-                taint_type=tt,
-                taint_name=nm,
-                locs_count=len(locs),
-                block_lines=len((block or '').splitlines()),
-            )
-            try:
-                lg.write_text(
-                    'llm/prompts',
-                    f'round{int(round_no)}-prompt{int(within)}_seq_{tseq}_id_{tid}.txt',
-                    prompt,
-                )
-            except Exception:
-                pass
-            lg.info('llm_replay_response', call_index=call_index, path=rp)
-
-        meta['resp_txt'] = replay_txt
-        return llm_calls, False, False
 
     if llm_max_calls is not None:
         try:
@@ -388,6 +371,48 @@ def _maybe_schedule_llm_call_for_meta(
         except Exception:
             pass
 
+    if ctx.get('llm_offline'):
+        base_dir = ctx.get('test_dir') if isinstance(ctx, dict) else None
+        base_dir = base_dir if base_dir else os.path.join(os.getcwd(), 'test')
+        resp_dir = os.path.join(base_dir, 'llm', 'responses')
+        replay_txt = None
+        replay_path = ''
+        try:
+            round_no2 = int(meta.get('round_no') or 0)
+            within_round2 = int(meta.get('round_prompt_index') or 0)
+        except Exception:
+            round_no2 = 0
+            within_round2 = 0
+        prefixes = []
+        if round_no2 and within_round2:
+            prefixes.append(f'round{int(round_no2)}-response{int(within_round2)}')
+        prefixes.append(f'response_{int(call_index)}')
+        try:
+            fns = list(os.listdir(resp_dir))
+        except Exception:
+            fns = []
+        for pref in prefixes:
+            for fn in fns:
+                if not isinstance(fn, str):
+                    continue
+                if fn.startswith(pref) and fn.endswith('.txt'):
+                    replay_path = os.path.join(resp_dir, fn)
+                    replay_txt = _try_read_text(replay_path)
+                    if replay_txt is not None:
+                        break
+                    replay_path = ''
+            if replay_txt is not None:
+                break
+        if replay_txt is None:
+            meta['resp_txt'] = ''
+            if lg is not None:
+                lg.warning('llm_offline_missing_replay', call_index=call_index, path=replay_path, taint_type=tt, taint_name=nm)
+            return llm_calls, False, False
+        meta['resp_txt'] = replay_txt
+        if lg is not None:
+            lg.info('llm_replay_response', call_index=call_index, path=replay_path)
+        return llm_calls, False, False
+
     replay_paths = []
     try:
         round_no2 = int(meta.get('round_no') or 0)
@@ -413,10 +438,6 @@ def _maybe_schedule_llm_call_for_meta(
         meta['resp_txt'] = replay_txt
         if lg is not None:
             lg.info('llm_replay_response', call_index=call_index, path=replay_path)
-    elif ctx.get('llm_offline'):
-        meta['resp_txt'] = ''
-        if lg is not None:
-            lg.warning('llm_offline_missing_replay', call_index=call_index, path=replay_path, taint_type=tt, taint_name=nm)
     elif client is None:
         if lg is not None:
             lg.warning('llm_client_missing', taint_type=tt, taint_name=nm)
@@ -840,27 +861,47 @@ def process_taints_llm(initial, ctx):
                     )
                 except Exception:
                     pass
-            if enable_scope_opt:
-                try:
-                    round_metas = merge_round_metas_by_scope(round_metas)
-                except Exception:
-                    pass
 
         if stop_due_to_max_calls:
             round_metas = []
         scheduled_round_metas = []
         if round_metas:
-            for meta in round_metas:
-                if enable_scope_opt:
+            try:
+                from llm_utils.prompts.composite_prompt import pack_small_scopes_into_composites
+            except Exception:
+                pack_small_scopes_into_composites = None
+            if enable_scope_opt:
+                try:
+                    by_obj = {}
+                    for m in round_metas:
+                        if not isinstance(m, dict):
+                            continue
+                        k = (m.get('this_obj') or '').strip()
+                        by_obj.setdefault(k, []).append(m)
+                    merged2 = []
+                    for _, buf in by_obj.items():
+                        merged2.extend(merge_round_metas_by_scope(list(buf)))
+                    round_metas = merged2
+                except Exception:
+                    pass
+                for meta in round_metas:
                     merged_members = meta.get('merged_members')
-                    if isinstance(merged_members, list) and merged_members:
-                        try:
-                            meta['prompt'] = build_merged_llm_prompt(
-                                merged_members=merged_members,
-                                result_set=meta.get('block') or '',
-                            )
-                        except Exception:
-                            pass
+                    if not (isinstance(merged_members, list) and merged_members):
+                        continue
+                    try:
+                        meta['prompt'] = build_merged_llm_prompt(
+                            merged_members=merged_members,
+                            result_set=meta.get('block') or '',
+                        )
+                    except Exception:
+                        pass
+            if pack_small_scopes_into_composites is not None:
+                try:
+                    round_metas = pack_small_scopes_into_composites(round_metas, small_scope_max=30, max_prompt_seqs=100)
+                except Exception:
+                    pass
+
+            for meta in round_metas:
                 llm_calls, stop_due_to_max_calls, should_break = _maybe_schedule_llm_call_for_meta(
                     meta,
                     ctx=ctx,

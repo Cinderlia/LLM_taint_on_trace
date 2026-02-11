@@ -232,6 +232,21 @@ def _llm_replay_path(
                 return os.path.join(resp_dir, fn)
     except Exception:
         pass
+    try:
+        want = f'_seq_{int(seq)}_id_'
+        prefix = f'round{int(round_no)}-response' if round_no is not None else None
+        for fn in os.listdir(resp_dir):
+            if not isinstance(fn, str):
+                continue
+            if prefix and (not fn.startswith(prefix)):
+                continue
+            if want not in fn:
+                continue
+            if not fn.endswith('.txt'):
+                continue
+            return os.path.join(resp_dir, fn)
+    except Exception:
+        pass
     return exact
 
 
