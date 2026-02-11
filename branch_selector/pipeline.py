@@ -28,12 +28,12 @@ from branch_selector.core.config import load_config
 from branch_selector.core.scope_folding import ScopeSubsetFolder
 from branch_selector.prompt.llm_response import parse_llm_response, llm_response_has_valid_json
 from branch_selector.prompt.prompt_builder import build_prompt, format_section
-from branch_selector.trace.if_scope_expand import expand_if_seq_groups, expand_if_seq_groups_stream
+from branch_selector.trace.if_scope_expand import _expand_one_seq, _precompute_expand_indices
 from branch_selector.sim.test_simulator import simulate_response, write_prompt_text, write_response_json
 from branch_selector.trace.trace_extract import (
     build_loc_for_seq,
     build_seq_to_index,
-    collect_if_switch_seqs,
+    iter_if_switch_records,
     ensure_trace_index,
     load_nodes_and_edges,
 )
@@ -154,7 +154,6 @@ def _iter_if_switch_sections(
     logger: Logger | None = None,
 ) -> Iterable[dict]:
     seq_to_index = build_seq_to_index(trace_index_records)
-    seq_groups = collect_if_switch_seqs(trace_index_records=trace_index_records, nodes=nodes, seq_limit=seq_limit, logger=logger)
     cached_if_ids = _load_if_branch_cache_ids(if_branch_cache_path) if if_branch_cache_skip else set()
     if_cov_cache: dict[int, bool] = {}
     switch_cov_cache: dict[int, dict[int, bool]] = {}
@@ -166,6 +165,7 @@ def _iter_if_switch_sections(
     switch_cached_hit_count = 0
     switch_cached_skip_count = 0
     switch_cached_last_seq = None
+    indices = _precompute_expand_indices(trace_index_records, nodes)
 
     def _get_if_covered(if_id: int) -> tuple[bool, bool]:
         if int(if_id) in if_cov_cache:
@@ -181,20 +181,16 @@ def _iter_if_switch_sections(
         switch_cov_cache[int(switch_id)] = cov_map
         return cov_map, False
 
-    filtered_seq_groups: dict[int, list[int]] = {}
-    for seq in seq_groups.keys():
-        rec = None
-        idx = seq_to_index.get(int(seq))
-        if idx is not None and 0 <= idx < len(trace_index_records):
-            rec = trace_index_records[idx]
-        if rec is None:
-            for r in trace_index_records or []:
-                if int(seq) in (r.get("seqs") or []):
-                    rec = r
-                    break
-        if not isinstance(rec, dict):
-            filtered_seq_groups[int(seq)] = list(seq_groups.get(seq) or [])
-            continue
+    if logger is not None:
+        logger.info("section_iter_start")
+    processed = 0
+    for seq, rec in iter_if_switch_records(
+        trace_index_records=trace_index_records,
+        nodes=nodes,
+        seq_limit=seq_limit,
+        logger=logger,
+    ):
+        processed += 1
         if_ids = _collect_if_ids_in_record(rec, nodes, parent_of)
         switch_ids = _collect_switch_ids_in_record(rec, nodes)
         skip_due_to_if = False
@@ -287,27 +283,24 @@ def _iter_if_switch_sections(
                     )
         if (if_ids and skip_due_to_if and (not switch_ids or skip_due_to_switch)) or (switch_ids and skip_due_to_switch and not if_ids):
             continue
-        filtered_seq_groups[int(seq)] = list(seq_groups.get(seq) or [])
-    seq_groups = filtered_seq_groups
-    seq_iter = expand_if_seq_groups_stream(
-        seq_groups=seq_groups,
-        trace_index_records=trace_index_records,
-        nodes=nodes,
-        parent_of=parent_of,
-        children_of=children_of,
-        trace_path=trace_path,
-        scope_root=scope_root,
-        windows_root=windows_root,
-        nearest_seq_count=nearest_seq_count,
-        farthest_seq_count=farthest_seq_count,
-        max_workers=expand_workers,
-        logger=logger,
-    )
-    if logger is not None:
-        logger.info("section_iter_start", seqs=len(seq_groups))
-    for seq, rel_seqs in seq_iter:
+        seq_i, rel_seqs = _expand_one_seq(
+            seq=int(seq),
+            rel_seqs=[int(seq)],
+            trace_index_records=trace_index_records,
+            nodes=nodes,
+            parent_of=parent_of,
+            children_of=children_of,
+            trace_path=trace_path,
+            scope_root=scope_root,
+            windows_root=windows_root,
+            nearest_seq_count=nearest_seq_count,
+            farthest_seq_count=farthest_seq_count,
+            indices=indices,
+        )
+        if seq_i is None:
+            continue
         locs = []
-        for s in rel_seqs or []:
+        for s in (rel_seqs or []):
             loc = build_loc_for_seq(int(s), trace_index_records, seq_to_index)
             if loc:
                 locs.append(loc)
@@ -328,7 +321,9 @@ def _iter_if_switch_sections(
             sig_items.append(key)
         sig_items.sort()
         sig = tuple(sig_items) if sig_items else None
-        yield {"seq": int(seq), "lines": lines, "sig": sig, "scope_seqs": list(rel_seqs or [])}
+        yield {"seq": int(seq_i), "lines": lines, "sig": sig, "scope_seqs": list(rel_seqs or [])}
+    if logger is not None:
+        logger.info("section_iter_done", processed=processed)
 
 
 async def _run_analyze_seq(seq: int, *, sem: asyncio.Semaphore, llm_test_mode: bool, logger: Logger | None = None):

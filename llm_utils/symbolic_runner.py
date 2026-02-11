@@ -96,6 +96,48 @@ def _normalize_solutions(obj) -> list[dict]:
     return []
 
 
+def _extract_db_query_from_obj(obj) -> str:
+    keys = ("DB_QUERY", "db_query", "DBQUERY", "QUERY", "SQL")
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj:
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        sols = obj.get("solutions")
+        if isinstance(sols, list):
+            for s in sols:
+                if isinstance(s, dict):
+                    for k in keys:
+                        v = s.get(k)
+                        if isinstance(v, str) and v.strip():
+                            return v.strip()
+    if isinstance(obj, list):
+        for s in obj:
+            if isinstance(s, dict):
+                for k in keys:
+                    v = s.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    return ""
+
+
+def _extract_db_query_from_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        obj = json.loads(text)
+    except Exception:
+        js = _extract_json_text(text)
+        if not js:
+            return ""
+        try:
+            obj = json.loads(js)
+        except Exception:
+            return ""
+    return _extract_db_query_from_obj(obj)
+
+
 def parse_symbolic_response(text: str) -> list[dict]:
     if not isinstance(text, str) or not text.strip():
         return []
@@ -555,11 +597,14 @@ def write_symbolic_response(text: str, *, run_dir: str, seq: int) -> tuple[str, 
     json_path = os.path.join(resp_dir, f"symbolic_response_{int(seq)}.json")
     _write_text(raw_path, text)
     solutions = parse_symbolic_response(text)
+    db_query = _extract_db_query_from_text(text)
     session_ok = True
     fixed_any = False
     for sol in solutions or []:
         if not isinstance(sol, dict):
             continue
+        if db_query and not sol.get("DB_QUERY"):
+            sol["DB_QUERY"] = db_query
         sess = sol.get("SESSION")
         if sess is None:
             continue

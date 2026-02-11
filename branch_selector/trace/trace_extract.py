@@ -158,6 +158,77 @@ def collect_if_switch_seqs(
     return out
 
 
+def iter_if_switch_records(
+    *,
+    trace_index_records: list[dict],
+    nodes: dict,
+    seq_limit: int,
+    logger: Logger | None = None,
+) -> Iterable[tuple[int, dict]]:
+    seen_records = 0
+    non_filtered_seen = 0
+    filtered_records = 0
+    yielded = 0
+    yielded_seqs: set[int] = set()
+    limit = int(seq_limit) if seq_limit is not None else None
+    for rec in trace_index_records or []:
+        seen_records += 1
+        rec_path = rec.get("path")
+        if _path_is_filtered(rec_path):
+            filtered_records += 1
+            if logger is not None:
+                logger.debug(
+                    "if_switch_path_filtered",
+                    path=rec_path,
+                    line=rec.get("line"),
+                    index=rec.get("index"),
+                )
+            continue
+        seqs = []
+        for s in rec.get("seqs") or []:
+            try:
+                si = int(s)
+            except Exception:
+                continue
+            non_filtered_seen += 1
+            if limit is not None and non_filtered_seen > limit:
+                continue
+            seqs.append(si)
+        if not seqs:
+            continue
+        node_ids = rec.get("node_ids") or []
+        has_if = False
+        has_switch = False
+        for nid in node_ids:
+            try:
+                ni = int(nid)
+            except Exception:
+                continue
+            tt = ((nodes.get(int(ni)) or {}).get("type") or "").strip()
+            if tt in ("AST_IF", "AST_IF_ELEM"):
+                has_if = True
+            elif tt == "AST_SWITCH":
+                has_switch = True
+            if has_if or has_switch:
+                break
+        if not (has_if or has_switch):
+            continue
+        min_seq = min(seqs)
+        if min_seq in yielded_seqs:
+            continue
+        yielded_seqs.add(int(min_seq))
+        yielded += 1
+        yield int(min_seq), rec
+    if logger is not None:
+        logger.debug(
+            "if_switch_path_filter_stats",
+            records=seen_records,
+            filtered=filtered_records,
+            seq_limit=limit,
+        )
+        logger.info("collect_if_switch_seqs_done", records=seen_records, seqs=yielded)
+
+
 def build_loc_for_seq(seq: int, trace_index_records: list[dict], seq_to_index: dict[int, int]) -> dict | None:
     rec = _record_for_seq(int(seq), trace_index_records, seq_to_index)
     if not isinstance(rec, dict):

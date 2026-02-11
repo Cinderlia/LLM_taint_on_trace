@@ -834,15 +834,22 @@ def process_taints(initial, ctx):
     """Run taint processing in either offline mode or LLM-assisted mode."""
     if ctx.get('llm_enabled'):
         return process_taints_llm(initial, ctx)
+    logger = ctx.get('logger') if isinstance(ctx, dict) else None
+    if logger is not None:
+        logger.info('taint_process_start', initial=len(initial or []))
     preA = list(initial)
     preB = []
     useA = True
+    round_idx = 0
     while preA or preB:
         active = preA if useA else preB
         if not active:
             useA = not useA
             continue
+        round_idx += 1
+        active_size = len(active)
         nxt = []
+        processed = 0
         for t in list(active):
             fn = REGISTRY.get(t.get('type') or '')
             if fn:
@@ -854,12 +861,26 @@ def process_taints(initial, ctx):
                     elif isinstance(s, dict):
                         nxt.append(s)
             active.pop(0)
+            processed += 1
+        if logger is not None:
+            other = preB if useA else preA
+            logger.info(
+                'taint_round',
+                round=round_idx,
+                queue=('A' if useA else 'B'),
+                active=active_size,
+                processed=processed,
+                next=len(nxt),
+                pending_other=len(other),
+            )
         if useA:
             preA = nxt
             useA = False
         else:
             preB = nxt
             useA = True
+    if logger is not None:
+        logger.info('taint_process_done', rounds=round_idx)
     return []
  
 def parse_loc(loc):
