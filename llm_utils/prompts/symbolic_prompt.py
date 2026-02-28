@@ -7,11 +7,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+from urllib.parse import parse_qsl, urlsplit
 from typing import Any
 
 
 DEFAULT_TEST_COMMAND_PATH = os.path.join("input", "测试命令.txt")
+DEFAULT_URL_PATH = os.path.join("input", "url.txt")
 
 
 def _read_text(path: str) -> str:
@@ -60,6 +63,50 @@ def _extract_test_command_fields(test_command_text: str) -> tuple[list[str], dic
             continue
 
     return env_lines, {"COOKIE": cookie_value, "GET": get_value, "POST": post_value, "SEED": seed_value}
+
+
+def _extract_url_fields(url_text: str) -> dict[str, str]:
+    url_value = ""
+    cookie_value = ""
+    get_value = ""
+    post_value = ""
+    if not isinstance(url_text, str) or not url_text.strip():
+        return {"URL": url_value, "COOKIE": cookie_value, "GET": get_value, "POST": post_value}
+    for raw in url_text.splitlines() or []:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        m_cookie = re.search(r"\bCookie\s*:\s*(.*)$", line, flags=re.IGNORECASE)
+        if m_cookie and not cookie_value:
+            cookie_value = (m_cookie.group(1) or "").strip()
+            continue
+        if line.startswith("COOKIE:") and not cookie_value:
+            cookie_value = (line.split("COOKIE:", 1)[1] or "").strip()
+            continue
+        if line.startswith("GET:") and not get_value:
+            get_value = (line.split("GET:", 1)[1] or "").strip()
+            continue
+        if line.startswith("POST:") and not post_value:
+            post_value = (line.split("POST:", 1)[1] or "").strip()
+            continue
+        if not url_value:
+            m_url = re.search(r"(https?://[^\s\"']+)", line)
+            if m_url:
+                url_value = (m_url.group(1) or "").strip()
+                continue
+    if not url_value:
+        m_url = re.search(r"(https?://[^\s\"']+)", url_text)
+        if m_url:
+            url_value = (m_url.group(1) or "").strip()
+    if url_value and not get_value:
+        try:
+            qs = urlsplit(url_value).query or ""
+            if qs:
+                pairs = parse_qsl(qs, keep_blank_values=True)
+                get_value = "&".join([f"{k}={v}" for k, v in pairs]).strip()
+        except Exception:
+            get_value = get_value
+    return {"URL": url_value, "COOKIE": cookie_value, "GET": get_value, "POST": post_value}
 
 
 def _filter_env_lines(env_lines: list[str], *, hidden_keys: set[str]) -> list[str]:
@@ -742,8 +789,18 @@ def generate_symbolic_execution_prompt(
         os.path.join(os.getcwd(), DEFAULT_TEST_COMMAND_PATH),
         fallback=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), DEFAULT_TEST_COMMAND_PATH),
     )
-    test_command_text = _read_text(test_command_path)
-    env_lines, req_fields = _extract_test_command_fields(test_command_text)
+    url_path = _resolve_existing_path(
+        os.path.join(os.getcwd(), DEFAULT_URL_PATH),
+        fallback=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), DEFAULT_URL_PATH),
+    )
+    env_lines: list[str] = []
+    req_fields: dict[str, str] = {}
+    if test_command_path and os.path.exists(test_command_path):
+        test_command_text = _read_text(test_command_path)
+        env_lines, req_fields = _extract_test_command_fields(test_command_text)
+    elif url_path and os.path.exists(url_path):
+        url_text = _read_text(url_path)
+        req_fields = _extract_url_fields(url_text)
     env_lines = _filter_env_lines(
         env_lines,
         hidden_keys={"OPCODE_TRACE", "SCRIPT_FILENAME", "LOGIN_COOKIE", "SCRIPT_NAME"},

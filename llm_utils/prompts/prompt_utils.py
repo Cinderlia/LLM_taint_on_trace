@@ -576,22 +576,22 @@ def should_skip_llm_scope(scope_seqs, ctx, *, dedupe_key: str | None = None) -> 
                 continue
             if dk is not None and prev_key is not None and dk != prev_key:
                 continue
-            if cur_set.issubset(set(prev_set)):
-                if lg is not None and ctx.get('llm_scope_debug'):
-                    try:
-                        cur_sorted = sorted(cur_set)
-                        prev_sorted = sorted(set(prev_set))
-                        lg.debug(
-                            'llm_scope_dedupe_skip',
-                            cur_len=len(cur_set),
-                            prev_len=len(set(prev_set)),
-                            prev_index=i,
-                            cur_preview=cur_sorted[:12],
-                            prev_preview=prev_sorted[:12],
-                        )
-                    except Exception:
-                        pass
-                return True
+            # if cur_set.issubset(set(prev_set)):
+            #     if lg is not None and ctx.get('llm_scope_debug'):
+            #         try:
+            #             cur_sorted = sorted(cur_set)
+            #             prev_sorted = sorted(set(prev_set))
+            #             lg.debug(
+            #                 'llm_scope_dedupe_skip',
+            #                 cur_len=len(cur_set),
+            #                 prev_len=len(set(prev_set)),
+            #                 prev_index=i,
+            #                 cur_preview=cur_sorted[:12],
+            #                 prev_preview=prev_sorted[:12],
+            #             )
+            #         except Exception:
+            #             pass
+            #     return True
         except Exception:
             continue
     if history:

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from common.app_config import load_app_config
 from llm_utils import get_default_client
@@ -348,8 +349,65 @@ def _parse_test_command_text(text: str) -> dict:
     return {"env_lines": env_lines, "COOKIE": cookie_value, "GET": get_value, "POST": post_value}
 
 
+def _parse_url_text(text: str) -> dict:
+    env_lines: list[str] = []
+    cookie_value = ""
+    get_value = ""
+    post_value = ""
+    url_value = ""
+    if not isinstance(text, str) or not text.strip():
+        return {"env_lines": env_lines, "COOKIE": cookie_value, "GET": get_value, "POST": post_value, "URL": url_value, "MODE": "URL"}
+    for raw in text.splitlines() or []:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        m_cookie = re.search(r"\bCookie\s*:\s*(.*)$", line, flags=re.IGNORECASE)
+        if m_cookie and not cookie_value:
+            cookie_value = (m_cookie.group(1) or "").strip()
+            continue
+        if line.startswith("COOKIE:") and not cookie_value:
+            cookie_value = (line.split("COOKIE:", 1)[1] or "").strip()
+            continue
+        if line.startswith("GET:") and not get_value:
+            get_value = (line.split("GET:", 1)[1] or "").strip()
+            continue
+        if line.startswith("POST:") and not post_value:
+            post_value = (line.split("POST:", 1)[1] or "").strip()
+            continue
+        if not url_value:
+            m_url = re.search(r"(https?://[^\s\"']+)", line)
+            if m_url:
+                url_value = (m_url.group(1) or "").strip()
+                continue
+    if not url_value:
+        m_url = re.search(r"(https?://[^\s\"']+)", text or "")
+        if m_url:
+            url_value = (m_url.group(1) or "").strip()
+    if url_value and not get_value:
+        try:
+            qs = urlsplit(url_value).query or ""
+            if qs:
+                pairs = parse_qsl(qs, keep_blank_values=True)
+                get_value = _pairs_to_query([(k, v) for k, v in pairs])
+        except Exception:
+            get_value = get_value
+    return {"env_lines": env_lines, "COOKIE": cookie_value, "GET": get_value, "POST": post_value, "URL": url_value, "MODE": "URL"}
+
+
 def load_symbolic_solution_defaults(test_command_path: str) -> dict:
-    return _parse_test_command_text(_read_text(test_command_path))
+    if isinstance(test_command_path, str) and os.path.exists(test_command_path):
+        return _parse_test_command_text(_read_text(test_command_path))
+    url_path = ""
+    if isinstance(test_command_path, str) and test_command_path:
+        base_dir = os.path.dirname(test_command_path)
+        url_path = os.path.join(base_dir, "url.txt")
+        if not os.path.exists(url_path):
+            url_path = ""
+    if not url_path:
+        url_path = os.path.join(os.getcwd(), "input", "url.txt")
+    if url_path and os.path.exists(url_path):
+        return _parse_url_text(_read_text(url_path))
+    return _parse_test_command_text("")
 
 
 def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = None, seq: int | None = None) -> str:
@@ -510,7 +568,43 @@ def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = Non
         if sess_content:
             session_id = f"sym-{int(seq)}"
             cookie_value = _inject_phpsessid(cookie_value or "", session_id)
+    is_url_mode = bool((defaults or {}).get("MODE") == "URL" or (defaults or {}).get("URL"))
     lines: list[str] = []
+    if is_url_mode:
+        if "ENV" in norm and env_lines:
+            lines.extend(env_lines)
+        url_value = str((defaults or {}).get("URL") or "").strip()
+        url_out = url_value
+        if url_value:
+            try:
+                u = urlsplit(url_value)
+                url_out = urlunsplit((u.scheme, u.netloc, u.path, get_value or "", u.fragment))
+            except Exception:
+                url_out = url_value
+        if sess_content and seq is not None:
+            sess_path = f"/tmp/php_sessions/sess_sym-{int(seq)}"
+            lines.append(f"echo -n {_shell_single_quote(sess_content)} > {sess_path}")
+            lines.append(f"chown www-data {sess_path}")
+        cookie_parts = _cookie_parts_from_text(cookie_value or "")
+        post_parts = _split_query_pairs(post_value or "")
+        cmd_parts = ["curl"]
+        for k, v in cookie_parts:
+            ks = (k or "").strip()
+            if not ks:
+                continue
+            if v is None:
+                cmd_parts.extend(["-b", _shell_single_quote(ks)])
+            else:
+                cmd_parts.extend(["-b", _shell_single_quote(f"{ks}={v}")])
+        for k, v in post_parts:
+            ks = (k or "").strip()
+            if not ks:
+                continue
+            cmd_parts.extend(["-d", _shell_single_quote(f"{ks}={v}")])
+        if url_out:
+            cmd_parts.append(_shell_single_quote(url_out))
+        lines.append(" ".join(cmd_parts))
+        return "\n".join(lines).rstrip() + "\n"
     if env_lines:
         lines.extend(env_lines)
         lines.append("")
@@ -527,6 +621,7 @@ def format_symbolic_solution_text(solution: dict, *, defaults: dict | None = Non
     if sess_content and seq is not None:
         sess_path = f"/tmp/php_sessions/sess_sym-{int(seq)}"
         lines.append(f"echo -n {_shell_single_quote(sess_content)} > {sess_path}")
+        lines.append(f"chown www-data {sess_path}")
     return "\n".join(lines).rstrip() + "\n"
 
 
