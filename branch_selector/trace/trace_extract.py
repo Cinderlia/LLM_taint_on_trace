@@ -11,7 +11,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from common.logger import Logger
-from utils.extractors.if_extract import load_nodes, load_ast_edges
+from utils.extractors.if_extract import load_nodes, load_ast_edges, collect_if_ids_for_record, collect_switch_ids_for_record
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
 from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
 
@@ -162,6 +162,8 @@ def iter_if_switch_records(
     *,
     trace_index_records: list[dict],
     nodes: dict,
+    parent_of: dict,
+    top_id_to_file: dict,
     seq_limit: int,
     logger: Logger | None = None,
 ) -> Iterable[tuple[int, dict]]:
@@ -205,12 +207,17 @@ def iter_if_switch_records(
             except Exception:
                 continue
             tt = ((nodes.get(int(ni)) or {}).get("type") or "").strip()
-            if tt in ("AST_IF", "AST_IF_ELEM"):
+            if tt in ("AST_IF", "AST_IF_ELEM", "AST_ELSEIF"):
                 has_if = True
             elif tt == "AST_SWITCH":
                 has_switch = True
             if has_if or has_switch:
                 break
+        if not (has_if or has_switch):
+            if_ids = collect_if_ids_for_record(rec, nodes=nodes, parent_of=parent_of, top_id_to_file=top_id_to_file)
+            switch_ids = collect_switch_ids_for_record(rec, nodes=nodes, parent_of=parent_of, top_id_to_file=top_id_to_file)
+            has_if = bool(if_ids)
+            has_switch = bool(switch_ids)
         if not (has_if or has_switch):
             continue
         min_seq = min(seqs)

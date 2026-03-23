@@ -341,6 +341,210 @@ def extract_if_elements(arg, nodes_path=None, rels_path=None):
                 result['unary_ops'].append({'id': x, 'op': nodes[x].get('flags') or ''})
     return {'arg': arg, 'path': path, 'line': line, 'targets': targets, 'result': result}
 
+
+def _file_match(nid: int, nodes: dict, parent_of: dict, top_id_to_file: dict, path: str) -> bool:
+    if not path or nid is None:
+        return False
+    try:
+        top = resolve_top_id(int(nid), parent_of, nodes, top_id_to_file)
+    except Exception:
+        return False
+    if top is None:
+        return False
+    return top_id_to_file.get(int(top)) == path
+
+
+def _scan_nodes_for_line(path: str, line: int, nodes: dict, parent_of: dict, top_id_to_file: dict, types: set[str]) -> list[int]:
+    if not path or line is None:
+        return []
+    out = []
+    for nid, nd in (nodes or {}).items():
+        try:
+            ln = nd.get('lineno')
+            if ln is None or int(ln) != int(line):
+                continue
+        except Exception:
+            continue
+        tt = (nd.get('type') or '').strip()
+        if tt not in types:
+            continue
+        if not _file_match(int(nid), nodes, parent_of, top_id_to_file, path):
+            continue
+        out.append(int(nid))
+    return out
+
+
+def _collect_if_elems_from_if(if_id: int, children_of: dict, nodes: dict, line: int | None = None) -> list[int]:
+    out = []
+    q = [int(if_id)]
+    seen = set()
+    while q:
+        x = q.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        nx = nodes.get(int(x)) or {}
+        tt = (nx.get('type') or '').strip()
+        if tt == 'AST_IF_ELEM':
+            if line is None:
+                out.append(int(x))
+            else:
+                try:
+                    ln = int(nx.get('lineno'))
+                except Exception:
+                    ln = None
+                if ln is not None and int(ln) == int(line):
+                    out.append(int(x))
+        for c in children_of.get(int(x), []) or []:
+            try:
+                q.append(int(c))
+            except Exception:
+                continue
+    if out:
+        return out
+    out2 = []
+    q = [int(if_id)]
+    seen = set()
+    while q:
+        x = q.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        nx = nodes.get(int(x)) or {}
+        tt = (nx.get('type') or '').strip()
+        if tt == 'AST_IF_ELEM':
+            out2.append(int(x))
+        for c in children_of.get(int(x), []) or []:
+            try:
+                q.append(int(c))
+            except Exception:
+                continue
+    return out2
+
+
+def resolve_if_elem_targets(
+    *,
+    path: str,
+    line: int,
+    record: dict | None,
+    nodes: dict,
+    parent_of: dict,
+    children_of: dict,
+    top_id_to_file: dict,
+) -> list[int]:
+    types = {'AST_IF', 'AST_IF_ELEM', 'AST_ELSEIF', 'AST_SWITCH'}
+    candidates = (record or {}).get('node_ids') or []
+    targets = []
+    for nid in candidates:
+        try:
+            ni = int(nid)
+        except Exception:
+            continue
+        tt = ((nodes.get(int(ni)) or {}).get('type') or '').strip()
+        if tt in types:
+            targets.append(int(ni))
+    if not targets:
+        targets = _scan_nodes_for_line(path, line, nodes, parent_of, top_id_to_file, types)
+    out = []
+    seen = set()
+    for nid in targets or []:
+        tt = ((nodes.get(int(nid)) or {}).get('type') or '').strip()
+        if tt in ('AST_IF', 'AST_ELSEIF'):
+            elems = _collect_if_elems_from_if(int(nid), children_of, nodes, line)
+            if elems:
+                for e in elems:
+                    if int(e) not in seen:
+                        seen.add(int(e))
+                        out.append(int(e))
+            else:
+                if int(nid) not in seen:
+                    seen.add(int(nid))
+                    out.append(int(nid))
+        else:
+            if int(nid) not in seen:
+                seen.add(int(nid))
+                out.append(int(nid))
+    return out
+
+
+def collect_if_ids_for_record(
+    record: dict | None,
+    *,
+    nodes: dict,
+    parent_of: dict,
+    top_id_to_file: dict,
+) -> list[int]:
+    types = {'AST_IF', 'AST_IF_ELEM', 'AST_ELSEIF'}
+    out: set[int] = set()
+    for nid in (record or {}).get('node_ids') or []:
+        ni = safe_int(nid)
+        if ni is None:
+            continue
+        tt = ((nodes.get(int(ni)) or {}).get('type') or '').strip()
+        if tt == 'AST_IF':
+            out.add(int(ni))
+            continue
+        if tt in ('AST_IF_ELEM', 'AST_ELSEIF'):
+            cur = parent_of.get(int(ni))
+            steps = 0
+            while cur is not None and steps < 12:
+                ct = ((nodes.get(int(cur)) or {}).get('type') or '').strip()
+                if ct == 'AST_IF':
+                    out.add(int(cur))
+                    break
+                cur = parent_of.get(int(cur))
+                steps += 1
+    if out:
+        return sorted(out)
+    rec = record or {}
+    p = norm_trace_path(rec.get('path') or '')
+    ln = rec.get('line')
+    if not p or ln is None:
+        return []
+    for nid in _scan_nodes_for_line(p, int(ln), nodes, parent_of, top_id_to_file, types):
+        tt = ((nodes.get(int(nid)) or {}).get('type') or '').strip()
+        if tt == 'AST_IF':
+            out.add(int(nid))
+            continue
+        if tt in ('AST_IF_ELEM', 'AST_ELSEIF'):
+            cur = parent_of.get(int(nid))
+            steps = 0
+            while cur is not None and steps < 12:
+                ct = ((nodes.get(int(cur)) or {}).get('type') or '').strip()
+                if ct == 'AST_IF':
+                    out.add(int(cur))
+                    break
+                cur = parent_of.get(int(cur))
+                steps += 1
+    return sorted(out)
+
+
+def collect_switch_ids_for_record(
+    record: dict | None,
+    *,
+    nodes: dict,
+    parent_of: dict,
+    top_id_to_file: dict,
+) -> list[int]:
+    out: set[int] = set()
+    for nid in (record or {}).get('node_ids') or []:
+        ni = safe_int(nid)
+        if ni is None:
+            continue
+        tt = ((nodes.get(int(ni)) or {}).get('type') or '').strip()
+        if tt == 'AST_SWITCH':
+            out.add(int(ni))
+    if out:
+        return sorted(out)
+    rec = record or {}
+    p = norm_trace_path(rec.get('path') or '')
+    ln = rec.get('line')
+    if not p or ln is None:
+        return []
+    for nid in _scan_nodes_for_line(p, int(ln), nodes, parent_of, top_id_to_file, {'AST_SWITCH'}):
+        out.add(int(nid))
+    return sorted(out)
+
 def main():
     """CLI entrypoint: `python if_extract.py <path:line>` (writes `if_extract_output.txt`)."""
     cfg = load_app_config(argv=sys.argv[1:])
@@ -371,4 +575,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

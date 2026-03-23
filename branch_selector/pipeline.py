@@ -28,6 +28,8 @@ from branch_selector.core.config import load_config
 from branch_selector.core.scope_folding import ScopeSubsetFolder
 from branch_selector.prompt.llm_response import parse_llm_response, llm_response_has_valid_json
 from branch_selector.prompt.prompt_builder import build_prompt, format_section
+from branch_selector.prompt.sql_prompt_builder import build_prompt as build_sql_prompt, format_section as format_sql_section
+from branch_selector.sql.sql_scope_expand import iter_sql_sections
 from branch_selector.trace.if_scope_expand import _expand_one_seq, _precompute_expand_indices
 from branch_selector.sim.test_simulator import simulate_response, write_prompt_text, write_response_json
 from branch_selector.trace.trace_extract import (
@@ -40,7 +42,9 @@ from branch_selector.trace.trace_extract import (
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
 from if_branch_coverage import check_if_branch_coverage
 from if_branch_coverage.switch_coverage import check_switch_branch_coverage
-from utils.cpg_utils.graph_mapping import safe_int
+from utils.cpg_utils.graph_mapping import safe_int, norm_nodes_path
+from if_branch_coverage.if_scope import get_if_file_path
+from utils.extractors.if_extract import collect_if_ids_for_record, collect_switch_ids_for_record
 
 
 def _safe_rmtree(p: str) -> None:
@@ -76,46 +80,15 @@ def _clear_seq_dirs(base_dir: str) -> None:
         _safe_rmtree(seq_dir)
 
 
-def _collect_if_ids_in_record(record: dict, nodes: dict, parent_of: dict[int, int]) -> list[int]:
-    if not isinstance(record, dict):
-        return []
-    out: set[int] = set()
-    for nid in record.get("node_ids") or []:
-        ni = safe_int(nid)
-        if ni is None:
-            continue
-        tt = ((nodes.get(int(ni)) or {}).get("type") or "").strip()
-        if tt == "AST_IF":
-            out.add(int(ni))
-            continue
-        if tt == "AST_IF_ELEM":
-            cur = parent_of.get(int(ni))
-            steps = 0
-            while cur is not None and steps < 8:
-                ct = ((nodes.get(int(cur)) or {}).get("type") or "").strip()
-                if ct == "AST_IF":
-                    out.add(int(cur))
-                    break
-                cur = parent_of.get(int(cur))
-                steps += 1
-    return sorted(out)
+def _collect_if_ids_in_record(record: dict, nodes: dict, parent_of: dict[int, int], top_id_to_file: dict) -> list[int]:
+    return collect_if_ids_for_record(record, nodes=nodes, parent_of=parent_of, top_id_to_file=top_id_to_file)
 
 
-def _collect_switch_ids_in_record(record: dict, nodes: dict) -> list[int]:
-    if not isinstance(record, dict):
-        return []
-    out: set[int] = set()
-    for nid in record.get("node_ids") or []:
-        ni = safe_int(nid)
-        if ni is None:
-            continue
-        tt = ((nodes.get(int(ni)) or {}).get("type") or "").strip()
-        if tt == "AST_SWITCH":
-            out.add(int(ni))
-    return sorted(out)
+def _collect_switch_ids_in_record(record: dict, nodes: dict, parent_of: dict[int, int], top_id_to_file: dict) -> list[int]:
+    return collect_switch_ids_for_record(record, nodes=nodes, parent_of=parent_of, top_id_to_file=top_id_to_file)
 
 
-def _load_if_branch_cache_ids(cache_path: str | None) -> set[int]:
+def _load_if_branch_cache_ids(cache_path: str | None) -> set[str]:
     if not cache_path or not os.path.exists(cache_path):
         return set()
     try:
@@ -125,12 +98,13 @@ def _load_if_branch_cache_ids(cache_path: str | None) -> set[int]:
         return set()
     if not isinstance(obj, dict):
         return set()
-    out: set[int] = set()
+    out: set[str] = set()
     for k in obj.keys():
-        ki = safe_int(k)
-        if ki is None:
+        try:
+            ks = str(k)
+        except Exception:
             continue
-        out.add(int(ki))
+        out.add(ks)
     return out
 
 
@@ -141,6 +115,7 @@ def _iter_if_switch_sections(
     nodes: dict,
     parent_of: dict,
     children_of: dict,
+    top_id_to_file: dict,
     seq_limit: int,
     scope_root: str,
     trace_index_path: str,
@@ -154,7 +129,7 @@ def _iter_if_switch_sections(
     logger: Logger | None = None,
 ) -> Iterable[dict]:
     seq_to_index = build_seq_to_index(trace_index_records)
-    cached_if_ids = _load_if_branch_cache_ids(if_branch_cache_path) if if_branch_cache_skip else set()
+    cached_if_keys = _load_if_branch_cache_ids(if_branch_cache_path) if if_branch_cache_skip else set()
     if_cov_cache: dict[int, bool] = {}
     switch_cov_cache: dict[int, dict[int, bool]] = {}
     if_cached_seq_count = 0
@@ -187,16 +162,29 @@ def _iter_if_switch_sections(
     for seq, rec in iter_if_switch_records(
         trace_index_records=trace_index_records,
         nodes=nodes,
+        parent_of=parent_of,
+        top_id_to_file=top_id_to_file,
         seq_limit=seq_limit,
         logger=logger,
     ):
         processed += 1
-        if_ids = _collect_if_ids_in_record(rec, nodes, parent_of)
-        switch_ids = _collect_switch_ids_in_record(rec, nodes)
+        if_ids = _collect_if_ids_in_record(rec, nodes, parent_of, top_id_to_file)
+        switch_ids = _collect_switch_ids_in_record(rec, nodes, parent_of, top_id_to_file)
         skip_due_to_if = False
         skip_due_to_switch = False
+        def _if_key(iid: int) -> str | None:
+            nx = nodes.get(int(iid)) or {}
+            ln = nx.get("lineno")
+            fp = get_if_file_path(int(iid), parent_of, nodes, top_id_to_file)
+            if fp and ln is not None:
+                return f"{norm_nodes_path(fp)}:{int(ln)}"
+            return None
         if if_branch_cache_skip and if_ids:
-            hit_ids = [int(x) for x in if_ids if int(x) in cached_if_ids]
+            hit_ids = []
+            for x in if_ids:
+                k = _if_key(int(x))
+                if k and k in cached_if_keys:
+                    hit_ids.append(int(x))
             if hit_ids:
                 if logger is not None:
                     logger.info("if_cache_skip", seq=int(seq), if_ids=hit_ids)
@@ -290,6 +278,7 @@ def _iter_if_switch_sections(
             nodes=nodes,
             parent_of=parent_of,
             children_of=children_of,
+            top_id_to_file=top_id_to_file,
             trace_path=trace_path,
             scope_root=scope_root,
             windows_root=windows_root,
@@ -326,13 +315,15 @@ def _iter_if_switch_sections(
         logger.info("section_iter_done", processed=processed)
 
 
-async def _run_analyze_seq(seq: int, *, sem: asyncio.Semaphore, llm_test_mode: bool, logger: Logger | None = None):
+async def _run_analyze_seq(seq: int, *, sem: asyncio.Semaphore, llm_test_mode: bool, sql_mode: bool, logger: Logger | None = None):
     async with sem:
         args = [sys.executable, os.path.join(os.getcwd(), "analyze_if_line.py"), str(int(seq))]
         if llm_test_mode:
             args.extend(["--llm-test", "--debug", "--prompt"])
         else:
             args.append("--llm")
+        if sql_mode:
+            args.append("--sql")
         proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
         if logger is not None:
@@ -361,6 +352,7 @@ async def _handle_llm_response(
     seqs_groups: list[list[int]],
     *,
     llm_test_mode: bool,
+    sql_mode: bool,
     sem: asyncio.Semaphore,
     analyze_tasks: set,
     logger: Logger | None = None,
@@ -378,7 +370,7 @@ async def _handle_llm_response(
                 continue
             seen.add(si)
             total += 1
-            task = asyncio.create_task(_run_analyze_seq(si, sem=sem, llm_test_mode=llm_test_mode, logger=logger))
+            task = asyncio.create_task(_run_analyze_seq(si, sem=sem, llm_test_mode=llm_test_mode, sql_mode=sql_mode, logger=logger))
             _track_task(analyze_tasks, task, logger=logger, event="analyze_task_start", seq=int(si))
             tasks.append(task)
     if logger is not None:
@@ -393,6 +385,9 @@ async def _flush_buffer(
     test_mode: bool,
     analyze_llm_test_mode: bool,
     base_prompt: str,
+    prompt_builder,
+    prompt_prefix: str,
+    sql_mode: bool,
     prompt_out_dir: str,
     response_out_dir: str,
     llm_client,
@@ -403,13 +398,13 @@ async def _flush_buffer(
     logger: Logger | None = None,
 ):
     start_ts = time.perf_counter()
-    prompt_text = build_prompt(sections=sections, separator=separator, base_prompt=base_prompt, logger=logger)
+    prompt_text = prompt_builder(sections=sections, separator=separator, base_prompt=base_prompt, logger=logger)
     if logger is not None:
         logger.info("buffer_flush_start", prompt_index=llm_call_index, sections=len(sections))
         logger.info("llm_call_start", prompt_index=llm_call_index, sections=len(sections), test_mode=bool(test_mode))
-    ppath = write_prompt_text(prompt_out_dir, f"prompt_{llm_call_index}.txt", prompt_text, logger=logger)
+    ppath = write_prompt_text(prompt_out_dir, f"{prompt_prefix}{llm_call_index}.txt", prompt_text, logger=logger)
     if test_mode:
-        rpath = os.path.join(response_out_dir, f"response_{llm_call_index}.json")
+        rpath = os.path.join(response_out_dir, f"{prompt_prefix}{llm_call_index}.json")
         resp = None
         if os.path.exists(rpath):
             try:
@@ -421,12 +416,13 @@ async def _flush_buffer(
                 logger.info("response_reused", path=rpath)
         if resp is None:
             resp = simulate_response(sections, pick_count=5, logger=logger)
-            _ = write_response_json(response_out_dir, f"response_{llm_call_index}.json", resp, logger=logger)
+            _ = write_response_json(response_out_dir, f"{prompt_prefix}{llm_call_index}.json", resp, logger=logger)
         _ = ppath
         resp_groups = parse_llm_response(json.dumps(resp, ensure_ascii=False), logger=logger)
         await _handle_llm_response(
             resp_groups,
             llm_test_mode=analyze_llm_test_mode,
+            sql_mode=sql_mode,
             sem=analyze_sem,
             analyze_tasks=analyze_tasks,
             logger=logger,
@@ -435,7 +431,7 @@ async def _flush_buffer(
             elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
             logger.info("llm_call_done", prompt_index=llm_call_index, duration_ms=elapsed_ms, test_mode=True)
         return
-    rpath = os.path.join(response_out_dir, f"response_{llm_call_index}.json")
+    rpath = os.path.join(response_out_dir, f"{prompt_prefix}{llm_call_index}.json")
     if os.path.exists(rpath):
         try:
             with open(rpath, "r", encoding="utf-8", errors="replace") as f:
@@ -449,6 +445,7 @@ async def _flush_buffer(
             await _handle_llm_response(
                 resp_groups,
                 llm_test_mode=analyze_llm_test_mode,
+                sql_mode=sql_mode,
                 sem=analyze_sem,
                 analyze_tasks=analyze_tasks,
                 logger=logger,
@@ -481,12 +478,13 @@ async def _flush_buffer(
         resp_payload = json.loads(txt)
     except Exception:
         resp_payload = {"raw": txt}
-    rpath = write_response_json(response_out_dir, f"response_{llm_call_index}.json", resp_payload, logger=logger)
+    rpath = write_response_json(response_out_dir, f"{prompt_prefix}{llm_call_index}.json", resp_payload, logger=logger)
     _ = ppath, rpath
     resp_groups = parse_llm_response(txt, logger=logger)
     await _handle_llm_response(
         resp_groups,
         llm_test_mode=analyze_llm_test_mode,
+        sql_mode=sql_mode,
         sem=analyze_sem,
         analyze_tasks=analyze_tasks,
         logger=logger,
@@ -553,11 +551,12 @@ async def run_pipeline(
     if llm_client is None and not cfg.test_mode:
         logger.warning("llm_client_missing")
     analyze_sem = asyncio.Semaphore(int(cfg.max_analyze_concurrency))
-    llm_sem = asyncio.Semaphore(max(1, int(cfg.buffer_count)))
+    llm_sem = asyncio.Semaphore(max(1, int(cfg.buffer_count) + int(cfg.sql_buffer_count)))
     pending_llm_tasks: set = set()
     pending_analyze_tasks: set = set()
 
     sections_queue: asyncio.Queue = asyncio.Queue()
+    sql_sections_queue: asyncio.Queue = asyncio.Queue()
     done_sentinel = object()
     expand_workers = max(1, int(cfg.buffer_count))
 
@@ -565,12 +564,13 @@ async def run_pipeline(
         loop = asyncio.get_running_loop()
         done_evt = asyncio.Event()
 
-        def _produce_sync():
+        def _produce_if_switch():
             for item in _iter_if_switch_sections(
                 trace_index_records=trace_index_records,
                 nodes=nodes,
                 parent_of=parent_of,
                 children_of=children_of,
+                top_id_to_file=top_id_to_file,
                 seq_limit=cfg.seq_limit,
                 scope_root=cfg.scope_root,
                 trace_index_path=trace_index_path,
@@ -584,11 +584,36 @@ async def run_pipeline(
                 logger=logger,
             ):
                 asyncio.run_coroutine_threadsafe(sections_queue.put(item), loop).result()
-            for _ in range(1):
-                asyncio.run_coroutine_threadsafe(sections_queue.put(done_sentinel), loop).result()
+            asyncio.run_coroutine_threadsafe(sections_queue.put(done_sentinel), loop).result()
+
+        def _produce_sql():
+            for item in iter_sql_sections(
+                trace_index_records=trace_index_records,
+                nodes=nodes,
+                parent_of=parent_of,
+                children_of=children_of,
+                seq_limit=cfg.seq_limit,
+                scope_root=cfg.scope_root,
+                trace_index_path=trace_index_path,
+                windows_root=cfg.windows_root,
+                nearest_seq_count=cfg.nearest_seq_count,
+                farthest_seq_count=cfg.farthest_seq_count,
+                trace_path=trace_path,
+                logger=logger,
+            ):
+                asyncio.run_coroutine_threadsafe(sql_sections_queue.put(item), loop).result()
+            asyncio.run_coroutine_threadsafe(sql_sections_queue.put(done_sentinel), loop).result()
+
+        def _run():
+            t1 = threading.Thread(target=_produce_if_switch, daemon=True)
+            t2 = threading.Thread(target=_produce_sql, daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
             loop.call_soon_threadsafe(done_evt.set)
 
-        t = threading.Thread(target=_produce_sync, daemon=True)
+        t = threading.Thread(target=_run, daemon=True)
         t.start()
         await done_evt.wait()
 
@@ -597,12 +622,19 @@ async def run_pipeline(
             await _flush_buffer(**kwargs)
 
     slot_count = max(1, int(cfg.buffer_count))
+    sql_slot_count = max(1, int(cfg.sql_buffer_count))
     available_slots: asyncio.Queue = asyncio.Queue()
+    sql_available_slots: asyncio.Queue = asyncio.Queue()
     for i in range(slot_count):
         available_slots.put_nowait(
             {"id": i + 1, "buffer": PromptBuffer(token_limit=cfg.buffer_token_limit), "sections": []}
         )
+    for i in range(sql_slot_count):
+        sql_available_slots.put_nowait(
+            {"id": i + 1, "buffer": PromptBuffer(token_limit=cfg.sql_buffer_token_limit), "sections": []}
+        )
     flush_index = 0
+    sql_flush_index = 0
 
     async def _flush_slot(slot: dict, sections: list[dict], prompt_index: int):
         await _flush_with_sem(
@@ -610,7 +642,10 @@ async def run_pipeline(
             separator="====",
             test_mode=cfg.test_mode,
             analyze_llm_test_mode=cfg.analyze_llm_test_mode,
-            base_prompt=cfg.base_prompt,
+            base_prompt="",
+            prompt_builder=build_prompt,
+            prompt_prefix="prompt_",
+            sql_mode=False,
             prompt_out_dir=prompt_out_dir,
             response_out_dir=response_out_dir,
             llm_client=llm_client,
@@ -624,6 +659,29 @@ async def run_pipeline(
         slot["buffer"].clear()
         await available_slots.put(slot)
 
+    async def _flush_sql_slot(slot: dict, sections: list[dict], prompt_index: int):
+        await _flush_with_sem(
+            sections=sections,
+            separator="====",
+            test_mode=cfg.test_mode,
+            analyze_llm_test_mode=cfg.analyze_llm_test_mode,
+            base_prompt=cfg.base_prompt,
+            prompt_builder=build_sql_prompt,
+            prompt_prefix="sql_prompt_",
+            sql_mode=True,
+            prompt_out_dir=prompt_out_dir,
+            response_out_dir=response_out_dir,
+            llm_client=llm_client,
+            llm_temperature=cfg.llm_temperature,
+            llm_call_index=prompt_index,
+            analyze_sem=analyze_sem,
+            analyze_tasks=pending_analyze_tasks,
+            logger=logger,
+        )
+        slot["sections"].clear()
+        slot["buffer"].clear()
+        await sql_available_slots.put(slot)
+
     async def _dispatch_slot(slot: dict):
         nonlocal flush_index
         flush_index += 1
@@ -636,6 +694,21 @@ async def run_pipeline(
             event="buffer_flush_task_start",
             buffer_id=int(slot.get("id") or 0),
             prompt_index=flush_index,
+            sections=len(sections_to_flush),
+        )
+
+    async def _dispatch_sql_slot(slot: dict):
+        nonlocal sql_flush_index
+        sql_flush_index += 1
+        sections_to_flush = list(slot["sections"])
+        task = asyncio.create_task(_flush_sql_slot(slot, sections_to_flush, sql_flush_index))
+        _track_task(
+            pending_llm_tasks,
+            task,
+            logger=logger,
+            event="buffer_flush_task_start",
+            buffer_id=int(slot.get("id") or 0),
+            prompt_index=sql_flush_index,
             sections=len(sections_to_flush),
         )
 
@@ -675,7 +748,43 @@ async def run_pipeline(
                 slot["sections"].append(sec)
                 slot["buffer"].add(sec, sec_text)
 
-    await asyncio.gather(producer(), consumer())
+    async def sql_consumer():
+        last_sig = None
+        folder = ScopeSubsetFolder()
+        slot = await sql_available_slots.get()
+        while True:
+            item = await sql_sections_queue.get()
+            if item is done_sentinel:
+                for emit in folder.flush():
+                    sec = format_sql_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
+                    sec_text = build_sql_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
+                    if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                        await _dispatch_sql_slot(slot)
+                        slot = await sql_available_slots.get()
+                    slot["sections"].append(sec)
+                    slot["buffer"].add(sec, sec_text)
+                if slot["sections"]:
+                    await _dispatch_sql_slot(slot)
+                break
+            sig = item.get("sig")
+            if sig is None:
+                last_sig = None
+            else:
+                if last_sig is not None and sig == last_sig:
+                    continue
+                last_sig = sig
+            item["mark_seqs"] = [item.get("seq")]
+            emits = folder.push(item)
+            for emit in emits:
+                sec = format_sql_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
+                sec_text = build_sql_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
+                if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                    await _dispatch_sql_slot(slot)
+                    slot = await sql_available_slots.get()
+                slot["sections"].append(sec)
+                slot["buffer"].add(sec, sec_text)
+
+    await asyncio.gather(producer(), consumer(), sql_consumer())
     if pending_llm_tasks:
         await asyncio.gather(*list(pending_llm_tasks))
     if pending_analyze_tasks:

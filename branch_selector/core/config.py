@@ -13,6 +13,8 @@ class BranchSelectorConfig:
     seq_limit: int = 10000
     buffer_token_limit: int = 3000
     buffer_count: int = 1
+    sql_buffer_token_limit: int = 3000
+    sql_buffer_count: int = 1
     max_analyze_concurrency: int = 5
     log_level: str = "INFO"
     if_branch_cache_skip: bool = False
@@ -85,6 +87,8 @@ def load_config(config_path: str | None = None) -> BranchSelectorConfig:
         seq_limit=_get_int("seq_limit", 10000),
         buffer_token_limit=_get_int("buffer_token_limit", 3000),
         buffer_count=_get_int("buffer_count", 1),
+        sql_buffer_token_limit=_get_int("sql_buffer_token_limit", 3000),
+        sql_buffer_count=_get_int("sql_buffer_count", 1),
         max_analyze_concurrency=_get_int("max_analyze_concurrency", 5),
         log_level=_get_str("log_level", "INFO"),
         if_branch_cache_skip=_get_bool("if_branch_cache_skip", False),

@@ -18,6 +18,7 @@ from common.logger import Logger
 from utils.extractors.if_extract import (
     norm_trace_path,
     collect_descendants,
+    resolve_if_elem_targets,
     load_nodes,
     load_ast_edges,
     get_string_children,
@@ -26,8 +27,9 @@ from utils.extractors.if_extract import (
 )
 from taint_handlers import REGISTRY
 from taint_handlers.llm.core.llm_process import process_taints_llm
-from utils.trace_utils.trace_edges import build_trace_index_records, load_trace_index_records, save_trace_index_records
+from utils.trace_utils.trace_index_utils import ensure_trace_index_records_for_seq
 from llm_utils.prompts.symbolic_prompt import generate_symbolic_execution_prompt
+from llm_utils.prompts.sql_symbolic_prompt import generate_symbolic_execution_prompt as generate_sql_symbolic_execution_prompt
 from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines, _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
 from llm_utils.symbolic_runner import (
     build_symbolic_response_example,
@@ -335,6 +337,43 @@ def extract_dim_index_taints(dim_id, nodes, children_of):
         for c in children_of.get(x, []) or []:
             q.append(c)
     return out
+
+def _normalize_literal_var_name(name: str) -> str:
+    v = (name or '').strip().strip("'\"")
+    try:
+        from taint_handlers.llm.splits.llm_var_split import _pick_identifier
+    except Exception:
+        _pick_identifier = None
+    if _pick_identifier:
+        got = _pick_identifier(v)
+        if got:
+            return got
+    return v
+
+def _literal_var_name_from_node(nid, nodes, children_of) -> str:
+    _, nm = node_display(nid, nodes, children_of)
+    return _normalize_literal_var_name(nm)
+
+def _collect_literal_vars_from_arg_list(arg_list_id, nodes, children_of):
+    if arg_list_id is None:
+        return []
+    out = []
+    seen = set()
+    q = [arg_list_id]
+    while q:
+        x = q.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        nx = nodes.get(x) or {}
+        t = (nx.get('type') or '').strip()
+        if t in ('string', 'AST_CONST', 'AST_NAME', 'integer', 'double'):
+            nm = _literal_var_name_from_node(x, nodes, children_of)
+            if nm:
+                out.append({'id': x, 'type': 'AST_VAR', 'name': nm})
+        for c in children_of.get(x, []) or []:
+            q.append(c)
+    return out
  
 def build_initial_taints(st, nodes, children_of, parent_of):
     """Build initial taint seeds from extracted if-element variables/props/dims/calls."""
@@ -343,68 +382,19 @@ def build_initial_taints(st, nodes, children_of, parent_of):
     seen = set()
     init_seq = st.get('seq')
     allowed = {'AST_VAR', 'AST_PROP', 'AST_DIM', 'AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL'}
-    def is_inside_prop_or_dim(nid):
+    def is_nonstandalone_var(nid):
         if nid is None:
             return False
         try:
-            cur = int(nid)
+            from taint_handlers.llm.core.llm_response import _is_nonstandalone_var
         except Exception:
+            _is_nonstandalone_var = None
+        if _is_nonstandalone_var is None:
             return False
         try:
-            from utils.cpg_utils.graph_mapping import is_in_dim_index_subtree, is_in_method_call_receiver_subtree, subtree_contains
+            return _is_nonstandalone_var(int(nid), {'nodes': nodes, 'children_of': children_of, 'parent_of': parent_of})
         except Exception:
-            is_in_dim_index_subtree = None
-            is_in_method_call_receiver_subtree = None
-            subtree_contains = None
-        def sorted_children(xid: int) -> list[int]:
-            ch = list(children_of.get(int(xid), []) or [])
-            ch.sort(key=lambda x: (nodes.get(x) or {}).get('childnum') if (nodes.get(x) or {}).get('childnum') is not None else 10**9)
-            out = []
-            for c in ch:
-                try:
-                    out.append(int(c))
-                except Exception:
-                    continue
-            return out
-        def prop_base_child_id(pid: int) -> int | None:
-            for c in sorted_children(pid):
-                cx = nodes.get(c) or {}
-                tt = (cx.get('type') or '').strip()
-                if tt == 'AST_ARG_LIST':
-                    continue
-                if cx.get('labels') == 'string' or tt == 'string':
-                    continue
-                return int(c)
-            return None
-        seen_local = set()
-        for _ in range(20):
-            if cur in seen_local:
-                break
-            seen_local.add(cur)
-            p = parent_of.get(cur) if isinstance(parent_of, dict) else None
-            if p is None:
-                return False
-            try:
-                p_i = int(p)
-            except Exception:
-                return False
-            pt = ((nodes.get(p_i) or {}).get('type') or '').strip()
-            if pt == 'AST_DIM':
-                if is_in_dim_index_subtree is not None and is_in_dim_index_subtree(int(p_i), int(nid), nodes, children_of):
-                    cur = p_i
-                    continue
-                return True
-            if pt == 'AST_PROP':
-                base_child = prop_base_child_id(int(p_i))
-                if base_child is not None and subtree_contains is not None and subtree_contains(int(base_child), int(nid), children_of):
-                    return True
-                if base_child is not None and subtree_contains is None and int(base_child) == int(cur):
-                    return True
-            if pt == 'AST_METHOD_CALL':
-                if is_in_method_call_receiver_subtree is not None and is_in_method_call_receiver_subtree(int(p_i), int(nid), nodes, children_of):
-                    return True
-            cur = p_i
-        return False
+            return False
     def collect_receiver_related_ids(recv_id):
         """Collect ids of receiver-related nodes so they can be excluded from initial taints."""
         if recv_id is None:
@@ -452,10 +442,22 @@ def build_initial_taints(st, nodes, children_of, parent_of):
             rec['seq'] = init_seq
         seen.add(tid)
         taints.append(rec)
+    def is_skip_var_name(name: str) -> bool:
+        v = (name or '').strip().lstrip('$')
+        return v in ('this',)
     for v in r.get('vars') or []:
-        if is_inside_prop_or_dim(v.get('id')):
+        if is_nonstandalone_var(v.get('id')):
+            continue
+        if is_skip_var_name(v.get('name', '')):
             continue
         add({'id': v['id'], 'type': 'AST_VAR', 'name': v.get('name', '')})
+    for c0 in r.get('consts') or []:
+        nm0 = _normalize_literal_var_name(c0.get('name') or '')
+        if not nm0:
+            continue
+        if is_skip_var_name(nm0):
+            continue
+        add({'id': c0.get('id'), 'type': 'AST_VAR', 'name': nm0})
     for p in r.get('props') or []:
         add({'id': p['id'], 'type': 'AST_PROP', 'base': p.get('base', ''), 'prop': p.get('prop', '')})
     for d in r.get('dims') or []:
@@ -483,8 +485,6 @@ def build_initial_taints(st, nodes, children_of, parent_of):
             add({'id': base_id, 'type': 'AST_PROP'})
         else:
             add({'id': did, 'type': 'AST_DIM', 'base': d.get('base', ''), 'key': d.get('key', '')})
-        for it in extract_dim_index_taints(d['id'], nodes, children_of):
-            add(it)
     for c in r.get('calls') or []:
         if c.get('kind') == 'method_call':
             add({'id': c['id'], 'type': 'AST_METHOD_CALL', 'name': c.get('name', ''), 'recv': c.get('recv', '')})
@@ -492,11 +492,16 @@ def build_initial_taints(st, nodes, children_of, parent_of):
             add({'id': c['id'], 'type': 'AST_CALL', 'name': c.get('name', '')})
         elif c.get('kind') == 'static_call':
             add({'id': c['id'], 'type': 'AST_STATIC_CALL', 'name': c.get('name', '')})
+        arg_list_id = c.get('arg_list_id')
+        for it in _collect_literal_vars_from_arg_list(arg_list_id, nodes, children_of):
+            if is_skip_var_name(it.get('name') or ''):
+                continue
+            add(it)
     return filter_method_call_receivers(taints)
 
 IF_LLM_TAINT_TEMPLATE = (
     "你是一个代码分析助手,请你找出下列代码中"
-    "所有的有可能影响到{name}分支方向的变量和函数调用"
+    "所有的有可能影响到布尔量({name})取值的变量和函数调用"
     + _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
 )
 
@@ -542,23 +547,7 @@ def _extract_if_condition_expr(code_line: str) -> str:
     return (s[open_i + 1 : close_i] or '').strip()
 
 def build_if_initial_taint(st, nodes, children_of, parent_of, trace_index_path: str, scope_root: str, windows_root: str):
-    inner = build_initial_taints(st, nodes, children_of, parent_of)
-    targets = st.get('targets') or []
-    if_id = targets[0] if targets else None
-    nm = _if_prompt_name(st, trace_index_path, scope_root, windows_root)
-    cond = _extract_if_condition_expr(nm)
-    if cond:
-        nm = cond
-    if not nm:
-        nm = 'if(...)'
-    return [{
-        'id': if_id,
-        'seq': st.get('seq'),
-        'type': 'AST_IF',
-        'name': nm,
-        '_if_inner_taints': inner,
-        'llm_prompt_template': IF_LLM_TAINT_TEMPLATE,
-    }]
+    return build_initial_taints(st, nodes, children_of, parent_of)
 
 def handle_if_taint(t, ctx):
     inner = t.get('_if_inner_taints') if isinstance(t, dict) else None
@@ -614,7 +603,7 @@ def handle_if_taint(t, ctx):
         ctx['result_set'] = rs[:before] + deduped + rs[after:]
     return results
  
-def extract_if_elements_fast(arg, seq, nodes, children_of, trace_index_records, seq_to_index):
+def extract_if_elements_fast(arg, seq, nodes, children_of, trace_index_records, seq_to_index, parent_of=None, top_id_to_file=None):
     """Locate `AST_IF_ELEM` nodes for a trace locator and extract relevant descendant nodes."""
     pth, ln_s = arg.rsplit(':', 1)
     line = int(ln_s)
@@ -632,13 +621,15 @@ def extract_if_elements_fast(arg, seq, nodes, children_of, trace_index_records, 
                 rec = r
                 break
 
-    candidates = rec.get('node_ids') if isinstance(rec, dict) else []
-    targets = []
-    for nid in candidates or []:
-        nx = nodes.get(nid) or {}
-        t = (nx.get('type') or '').strip()
-        if t in ('AST_IF_ELEM', 'AST_SWITCH'):
-            targets.append(nid)
+    targets = resolve_if_elem_targets(
+        path=path,
+        line=line,
+        record=rec if isinstance(rec, dict) else None,
+        nodes=nodes,
+        parent_of=parent_of or {},
+        children_of=children_of or {},
+        top_id_to_file=top_id_to_file or {},
+    )
 
     result = {
         'vars': [],
@@ -728,6 +719,19 @@ def extract_if_elements_fast(arg, seq, nodes, children_of, trace_index_records, 
             parts = [v for _, v in get_all_string_descendants(x, children_of, nodes)]
             v = parts[0] if parts else (nx.get('code') or nx.get('name') or '')
             result['consts'].append({'id': x, 'type': 'AST_NAME', 'name': v})
+            return
+        if t in ('string', 'integer', 'double'):
+            pt = ''
+            if isinstance(parent_of, dict):
+                try:
+                    pid = parent_of.get(x)
+                    pt = (nodes.get(pid) or {}).get('type') if pid is not None else ''
+                except Exception:
+                    pt = ''
+            if (pt or '').strip() in ('AST_PROP', 'AST_DIM', 'AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL', 'AST_CLASS_CONST', 'AST_STATIC_PROP'):
+                return
+            v = (nx.get('code') or nx.get('name') or '').strip()
+            result['consts'].append({'id': x, 'type': t, 'name': v})
             return
         if t == 'AST_METHOD_CALL':
             fn = ''
@@ -855,6 +859,253 @@ def extract_if_elements_fast(arg, seq, nodes, children_of, trace_index_records, 
                 handle_extracted_node(int(expr_root))
                 for x in collect_descendants(int(expr_root), children_of, nodes, int(expr_line)):
                     handle_extracted_node(int(x))
+
+    return {'arg': arg, 'path': path, 'line': line, 'targets': targets, 'result': result}
+
+
+def extract_sql_elements_fast(arg, seq, nodes, children_of, trace_index_records, seq_to_index, parent_of=None):
+    pth, ln_s = arg.rsplit(':', 1)
+    line = int(ln_s)
+    path = norm_trace_path(pth)
+
+    rec = None
+    idx = seq_to_index.get(seq)
+    if idx is not None and 0 <= idx < len(trace_index_records):
+        rec = trace_index_records[idx]
+    if rec is None:
+        for r in trace_index_records:
+            if r.get('path') != path or r.get('line') != line:
+                continue
+            if seq in (r.get('seqs') or []):
+                rec = r
+                break
+
+    try:
+        from branch_selector.sql.sql_query_detector import find_sql_query_calls_in_record
+    except Exception:
+        find_sql_query_calls_in_record = None
+    hits = find_sql_query_calls_in_record(rec, nodes, children_of) if find_sql_query_calls_in_record else []
+    targets = []
+    for h in hits or []:
+        try:
+            targets.append(int(h.get('id')))
+        except Exception:
+            continue
+
+    result = {
+        'vars': [],
+        'dims': [],
+        'props': [],
+        'consts': [],
+        'calls': [],
+        'isset': [],
+        'empty': [],
+        'class_consts': [],
+        'static_props': [],
+        'instanceof': [],
+        'conditional': [],
+        'binary_ops': [],
+        'unary_ops': []
+    }
+
+    def handle_extracted_node(x: int):
+        nx = nodes.get(x) or {}
+        t = (nx.get('type') or '').strip()
+        if t == 'AST_VAR':
+            ss = get_string_children(x, children_of, nodes)
+            name = ss[0][1] if ss else ''
+            result['vars'].append({'id': x, 'name': name})
+            return
+        if t == 'AST_DIM':
+            ch = list(children_of.get(x, []) or [])
+            ch.sort(key=lambda y: (nodes.get(y) or {}).get('childnum') if (nodes.get(y) or {}).get('childnum') is not None else 10**9)
+            base_id = None
+            key_id = None
+            if len(ch) >= 1:
+                base_id = ch[0]
+            if len(ch) >= 2:
+                key_id = ch[1]
+            base_nm = ''
+            if base_id is not None:
+                _, base_nm = node_display(int(base_id), nodes, children_of)
+            if not base_nm:
+                base_nm = find_first_var_string(x, children_of, nodes)
+            key = ''
+            if key_id is not None:
+                try:
+                    _, key_nm = node_display(int(key_id), nodes, children_of)
+                except Exception:
+                    key_nm = ''
+                key = (key_nm or '').strip()
+            if not key:
+                parts = [v for _, v in get_string_children(x, children_of, nodes)]
+                key = parts[0] if parts else ''
+            result['dims'].append({'id': x, 'base': base_nm, 'key': key})
+            return
+        if t == 'AST_PROP':
+            ch = list(children_of.get(x, []) or [])
+            ch.sort(key=lambda y: (nodes.get(y) or {}).get('childnum') if (nodes.get(y) or {}).get('childnum') is not None else 10**9)
+            base_id = None
+            for c in ch:
+                nc = nodes.get(c) or {}
+                ctt = (nc.get('type') or '').strip()
+                if ctt == 'AST_ARG_LIST':
+                    continue
+                if nc.get('labels') == 'string' or ctt == 'string':
+                    continue
+                base_id = c
+                break
+            base_nm = ''
+            if base_id is not None:
+                _, base_nm = node_display(int(base_id), nodes, children_of)
+            if not base_nm:
+                base_nm = find_first_var_string(x, children_of, nodes)
+            prop = ''
+            if len(ch) >= 2:
+                try:
+                    _, prop_nm = node_display(int(ch[1]), nodes, children_of)
+                except Exception:
+                    prop_nm = ''
+                prop = (prop_nm or '').strip()
+            if not prop:
+                parts = [v for _, v in get_string_children(x, children_of, nodes)]
+                prop = parts[0] if parts else ''
+            result['props'].append({'id': x, 'base': base_nm, 'prop': prop})
+            return
+        if t == 'AST_CONST':
+            parts = [v for _, v in get_all_string_descendants(x, children_of, nodes)]
+            result['consts'].append({'id': x, 'type': 'AST_CONST', 'name': parts[0] if parts else ''})
+            return
+        if t == 'AST_NAME':
+            parts = [v for _, v in get_all_string_descendants(x, children_of, nodes)]
+            v = parts[0] if parts else (nx.get('code') or nx.get('name') or '')
+            result['consts'].append({'id': x, 'type': 'AST_NAME', 'name': v})
+            return
+        if t in ('string', 'integer', 'double'):
+            pt = ''
+            if isinstance(parent_of, dict):
+                try:
+                    pid = parent_of.get(x)
+                    pt = (nodes.get(pid) or {}).get('type') if pid is not None else ''
+                except Exception:
+                    pt = ''
+            if (pt or '').strip() in ('AST_PROP', 'AST_DIM', 'AST_METHOD_CALL', 'AST_CALL', 'AST_STATIC_CALL', 'AST_CLASS_CONST', 'AST_STATIC_PROP'):
+                return
+            v = (nx.get('code') or nx.get('name') or '').strip()
+            result['consts'].append({'id': x, 'type': t, 'name': v})
+            return
+        if t == 'AST_METHOD_CALL':
+            fn = ''
+            recv = ''
+            recv_id = None
+            for c in children_of.get(x, []) or []:
+                nc = nodes.get(c) or {}
+                if nc.get('type') == 'AST_VAR':
+                    ssc = get_string_children(c, children_of, nodes)
+                    recv = ssc[0][1] if ssc else ''
+                    if recv_id is None:
+                        recv_id = c
+                if nc.get('labels') == 'string' or nc.get('type') == 'string':
+                    vv = nc.get('code') or nc.get('name') or ''
+                    if vv:
+                        fn = vv
+            arg_list_id = None
+            args = []
+            for c in children_of.get(x, []) or []:
+                nc = nodes.get(c) or {}
+                if nc.get('type') == 'AST_ARG_LIST':
+                    arg_list_id = c
+                    for ac in children_of.get(c, []) or []:
+                        anc = nodes.get(ac) or {}
+                        if anc.get('labels') == 'string' or anc.get('type') == 'string':
+                            vv = anc.get('code') or anc.get('name') or ''
+                            if vv:
+                                args.append({'id': ac, 'type': 'string', 'name': vv})
+                        elif anc.get('type') == 'AST_VAR':
+                            ssc = get_string_children(ac, children_of, nodes)
+                            vv = ssc[0][1] if ssc else ''
+                            if vv:
+                                args.append({'id': ac, 'type': 'AST_VAR', 'name': vv})
+                        elif anc.get('type') in ('AST_PROP', 'AST_DIM'):
+                            ssc = get_all_string_descendants(ac, children_of, nodes)
+                            vv = ssc[0][1] if ssc else ''
+                            if vv:
+                                args.append({'id': ac, 'type': anc.get('type'), 'name': vv})
+            result['calls'].append({'id': x, 'kind': 'method_call', 'name': fn, 'recv': recv, 'recv_id': recv_id, 'arg_list_id': arg_list_id, 'args': args})
+            return
+        if t == 'AST_CALL':
+            fn = ''
+            for c in children_of.get(x, []) or []:
+                nc = nodes.get(c) or {}
+                if nc.get('labels') == 'string' or nc.get('type') == 'string':
+                    vv = nc.get('code') or nc.get('name') or ''
+                    if vv:
+                        fn = vv
+            arg_list_id = None
+            args = []
+            for c in children_of.get(x, []) or []:
+                nc = nodes.get(c) or {}
+                if nc.get('type') == 'AST_ARG_LIST':
+                    arg_list_id = c
+                    for ac in children_of.get(c, []) or []:
+                        anc = nodes.get(ac) or {}
+                        if anc.get('labels') == 'string' or anc.get('type') == 'string':
+                            vv = anc.get('code') or anc.get('name') or ''
+                            if vv:
+                                args.append({'id': ac, 'type': 'string', 'name': vv})
+                        elif anc.get('type') == 'AST_VAR':
+                            ssc = get_string_children(ac, children_of, nodes)
+                            vv = ssc[0][1] if ssc else ''
+                            if vv:
+                                args.append({'id': ac, 'type': 'AST_VAR', 'name': vv})
+                        elif anc.get('type') in ('AST_PROP', 'AST_DIM'):
+                            ssc = get_all_string_descendants(ac, children_of, nodes)
+                            vv = ssc[0][1] if ssc else ''
+                            if vv:
+                                args.append({'id': ac, 'type': anc.get('type'), 'name': vv})
+            result['calls'].append({'id': x, 'kind': 'call', 'name': fn, 'recv': '', 'arg_list_id': arg_list_id, 'args': args})
+            return
+        if t == 'AST_STATIC_CALL':
+            cls = ''
+            fn = ''
+            for c in children_of.get(x, []) or []:
+                nc = nodes.get(c) or {}
+                if nc.get('type') == 'AST_NAME' or nc.get('labels') == 'string' or nc.get('type') == 'string':
+                    vv = nc.get('code') or nc.get('name') or ''
+                    if vv and not cls:
+                        cls = vv
+                    elif vv:
+                        fn = vv
+            arg_list_id = None
+            args = []
+            for c in children_of.get(x, []) or []:
+                nc = nodes.get(c) or {}
+                if nc.get('type') == 'AST_ARG_LIST':
+                    arg_list_id = c
+                    for ac in children_of.get(c, []) or []:
+                        anc = nodes.get(ac) or {}
+                        if anc.get('labels') == 'string' or anc.get('type') == 'string':
+                            vv = anc.get('code') or anc.get('name') or ''
+                            if vv:
+                                args.append({'id': ac, 'type': 'string', 'name': vv})
+                        elif anc.get('type') == 'AST_VAR':
+                            ssc = get_string_children(ac, children_of, nodes)
+                            vv = ssc[0][1] if ssc else ''
+                            if vv:
+                                args.append({'id': ac, 'type': 'AST_VAR', 'name': vv})
+                        elif anc.get('type') in ('AST_PROP', 'AST_DIM'):
+                            ssc = get_all_string_descendants(ac, children_of, nodes)
+                            vv = ssc[0][1] if ssc else ''
+                            if vv:
+                                args.append({'id': ac, 'type': anc.get('type'), 'name': vv})
+            result['calls'].append({'id': x, 'kind': 'static_call', 'name': fn, 'recv': cls, 'arg_list_id': arg_list_id, 'args': args})
+            return
+
+    for root in targets:
+        handle_extracted_node(int(root))
+        desc = collect_descendants(root, children_of, nodes, line)
+        for x in desc:
+            handle_extracted_node(int(x))
 
     return {'arg': arg, 'path': path, 'line': line, 'targets': targets, 'result': result}
  
@@ -1075,6 +1326,7 @@ def parse_cli_args(argv: list[str]) -> dict:
     - `--debug`: enable debug logging.
     - `--llm`: enable LLM-assisted taint loop (may call the configured LLM).
     - `--llm-test`: enable LLM-assisted loop in replay-only mode (never calls LLM).
+    - `--sql`: enable SQL-mode extraction for SQL callsites.
     - `--prompt`: accepted for compatibility (no behavioral change).
     - `--llm-max=<N>` / `--llm-max <N>`: limit number of LLM calls per run.
     """
@@ -1084,6 +1336,7 @@ def parse_cli_args(argv: list[str]) -> dict:
     llm_mode = any(x == '--llm' for x in args)
     llm_test_mode = any(x == '--llm-test' for x in args)
     prompt_mode = any(x == '--prompt' for x in args)
+    sql_mode = any(x == '--sql' for x in args)
 
     llm_max_calls = None
     for i, x in enumerate(args):
@@ -1104,6 +1357,7 @@ def parse_cli_args(argv: list[str]) -> dict:
         'llm_test_mode': bool(llm_test_mode),
         'llm_max_calls': llm_max_calls,
         'prompt_mode': bool(prompt_mode),
+        'sql_mode': bool(sql_mode),
     }
 
 def _parse_analyze_flags_from_config(cfg_raw: dict) -> dict:
@@ -1271,23 +1525,25 @@ def _run_analyze_once(
 
     trace_index_path = cfg.tmp_path('trace_index.json')
     os.makedirs(os.path.dirname(trace_index_path) or '.', exist_ok=True)
-    trace_index_records = load_trace_index_records(trace_index_path)
-    if trace_index_records is None:
-        trace_index_records = build_trace_index_records(trace_path, nodes_path, None)
-        save_trace_index_records(trace_index_path, trace_index_records, {'trace_path': 'trace.log', 'nodes_path': 'nodes.csv'})
-
-    seq_to_index = {}
-    for rec in trace_index_records:
-        idx = rec.get('index')
-        for s in rec.get('seqs') or []:
-            if s not in seq_to_index:
-                seq_to_index[s] = idx
+    trace_index_records, seq_to_index = ensure_trace_index_records_for_seq(
+        seq=int(n),
+        trace_path=trace_path,
+        nodes_path=nodes_path,
+        trace_index_path=trace_index_path,
+        logger=logger,
+    )
 
     nodes, top_id_to_file = load_nodes(nodes_path)
     parent_of, children_of = load_ast_edges(rels_path)
-    st = extract_if_elements_fast(arg, n, nodes, children_of, trace_index_records, seq_to_index)
-    if not (st.get('targets') or []):
-        return finish({'error': 'if_elem_not_found_for_trace_line'})
+    sql_mode = bool(opts.get('sql_mode'))
+    if sql_mode:
+        st = extract_sql_elements_fast(arg, n, nodes, children_of, trace_index_records, seq_to_index, parent_of)
+        if not (st.get('targets') or []):
+            return finish({'error': 'sql_call_not_found_for_trace_line'})
+    else:
+        st = extract_if_elements_fast(arg, n, nodes, children_of, trace_index_records, seq_to_index, parent_of, top_id_to_file)
+        if not (st.get('targets') or []):
+            return finish({'error': 'if_elem_not_found_for_trace_line'})
 
     st['seq'] = n
     try:
@@ -1399,7 +1655,8 @@ def _run_analyze_once(
     symbolic_empty = False
     if prompt_mode:
         try:
-            prompt_text = generate_symbolic_execution_prompt(
+            prompt_builder = generate_sql_symbolic_execution_prompt if sql_mode else generate_symbolic_execution_prompt
+            prompt_text = prompt_builder(
                 rs2,
                 input_seq=n,
                 input_path=ctx.get('path'),

@@ -33,7 +33,7 @@ def _build_ctx_for_seq(seq: int) -> dict:
     parent_of, children_of = load_ast_edges(rels_path)
 
     arg = read_trace_line(int(seq), trace_path)
-    st = extract_if_elements_fast(arg, int(seq), nodes, children_of, trace_index_records, seq_to_index)
+    st = extract_if_elements_fast(arg, int(seq), nodes, children_of, trace_index_records, seq_to_index, parent_of, top_id_to_file)
 
     ctx = {
         'input_seq': int(seq),

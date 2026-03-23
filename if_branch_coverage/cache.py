@@ -1,5 +1,5 @@
 """
-Small persistent cache for IF-branch coverage results (node_id -> covered bool).
+Small persistent cache for IF-branch coverage results (path:line -> covered bool).
 """
 
 import json
@@ -9,7 +9,7 @@ import os
 class IfBranchCoverageCache:
     """File-backed cache for per-AST_IF coverage checks."""
     def __init__(self, cache_path: str):
-        self._cache: dict[int, bool] = {}
+        self._cache: dict[str, bool] = {}
         self._cache_path = cache_path or ""
         self._loaded = False
 
@@ -28,10 +28,10 @@ class IfBranchCoverageCache:
             return
         for k, v in obj.items():
             try:
-                ki = int(k)
+                ks = str(k)
             except Exception:
                 continue
-            self._cache[ki] = bool(v)
+            self._cache[ks] = bool(v)
 
     def _save(self):
         if not self._cache_path:
@@ -47,21 +47,21 @@ class IfBranchCoverageCache:
         except Exception:
             return
 
-    def get(self, if_id):
+    def get(self, key):
         self._load()
         try:
-            key = int(if_id)
+            ks = str(key)
         except Exception:
             return None
-        return self._cache.get(key)
+        return self._cache.get(ks)
 
-    def set(self, if_id, value):
+    def set(self, key, value):
         self._load()
         try:
-            key = int(if_id)
+            ks = str(key)
         except Exception:
             return
-        self._cache[key] = bool(value)
+        self._cache[ks] = bool(value)
         self._save()
 
     def reset(self):

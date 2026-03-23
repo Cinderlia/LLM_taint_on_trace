@@ -577,6 +577,7 @@ def _expand_one_seq(
     nodes: dict,
     parent_of: dict,
     children_of: dict,
+    top_id_to_file: dict | None = None,
     trace_path: str,
     scope_root: str,
     windows_root: str,
@@ -603,7 +604,7 @@ def _expand_one_seq(
         arg = read_trace_line(seq_i, trace_path)
     if not arg:
         return seq_i, list(rel_seqs or []) or [seq_i]
-    st = extract_if_elements_fast(arg, seq_i, nodes, children_of, trace_index_records, seq_to_index)
+    st = extract_if_elements_fast(arg, seq_i, nodes, children_of, trace_index_records, seq_to_index, parent_of, top_id_to_file)
     if not (st.get('targets') or []):
         return seq_i, list(rel_seqs or []) or [seq_i]
     st['seq'] = seq_i

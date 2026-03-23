@@ -840,6 +840,7 @@ def generate_symbolic_execution_prompt(
             + seq_display
             + "行的if语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够让代码走向if语句另一个方向的外部输入。if语句的前面标注了当前的分支走向。"
         )
+        lines.append("同时，尝试从SQL注入的角度，生成一些特殊的输入值，去触发数据库的段错误。")
         lines.append(
             "仅反转"
             + seq_display
@@ -897,15 +898,18 @@ def generate_symbolic_execution_prompt(
             code_s = f"{switch_tag}{code_s}"
         lines.append(f"{seq_s} | {loc} | {code_s}")
     lines.append("")
+    lines.append("如果代码对参数的取值没有确切的要求（比如，仅要求非空、非零等），尽量从SQL注入的角度考虑，生成一些类似单边引号等的输入值，去尝试触发数据库的语法错误。")
+    lines.append("仅基于给出的代码和if语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
+    lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
+    lines.append("如果缺少部分信息，导致不能确定参数名称的具体格式，请尝试生成所有可能的格式。")
+    lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
+    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE、GET、SESSION参数（对应 JSON 字段：ENV/POST/COOKIE/GET/SESSION）。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分。不需要修改的部分请保持原样，可以不出现在JSON里面。")
+    lines.append("如果存在多个满足约束的输入，优先选择可能触发SQL解析错误的输入（如未闭合引号），而不是简单数值。")
+    lines.append("如果你需要查询数据库获取额外信息时，请直接输出查询语句，不输出解决方案。")
+    lines.append("如果你认为，仅靠目前提供的信息和你的先验知识，不足以反转该if语句，或者该if语句的条件表达式无法符号化，请输出空JSON。")
     lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
     lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE、GET、SESSION参数（对应 JSON 字段：ENV/POST/COOKIE/GET/SESSION）。可以修改一个或多个部分，但请直接返回修改之后的完整字段，不仅仅是你想修改的部分。不需要修改的部分请保持原样，可以不出现在JSON里面。")
     lines.append("如果需要修改SESSION参数，请在JSON的 SESSION 字段中直接输出合法的SESSION文件内容（即 session 文件的原始文本内容，而不是再包一层 JSON）。")
-    lines.append("仅基于给出的代码和 if 语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
-    lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
-    lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
-    lines.append("如果决定该if语句方向的变量不是来自上述五种输入（环境变量、COOKIE、POST、GET、SESSION），则认为无法修改。")
-    lines.append("如果你需要查询数据库，请直接输出查询语句。")
-    lines.append("如果你认为，无法反转该if语句，或者该if语句的条件表达式无法符号化，请输出空JSON。")
     lines.append("请输出一个JSON文件，示例：")
     lines.append("{")
     lines.append('  "solutions": [')

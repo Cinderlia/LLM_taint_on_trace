@@ -32,17 +32,28 @@ class IfBranchCoverageService:
         nid = safe_int(if_id)
         if nid is None:
             return False
-        cached = get_cached_result(nid)
-        if cached is not None:
-            return bool(cached)
         if not is_ast_if(nid, self.nodes):
-            set_cached_result(nid, False)
+            # compute key if possible for negative cache
+            nx = self.nodes.get(int(nid)) or {}
+            if_line = nx.get("lineno")
+            file_path = get_if_file_path(nid, self.parent_of, self.nodes, self.top_id_to_file)
+            if file_path and if_line is not None:
+                norm_path = norm_nodes_path(file_path)
+                key = f"{norm_path}:{int(if_line)}"
+                set_cached_result(key, False)
             return False
         file_path = get_if_file_path(nid, self.parent_of, self.nodes, self.top_id_to_file)
         if not file_path:
-            set_cached_result(nid, False)
+            return False
+        nx = self.nodes.get(int(nid)) or {}
+        if_line = nx.get("lineno")
+        if if_line is None:
             return False
         norm_path = norm_nodes_path(file_path)
+        key = f"{norm_path}:{int(if_line)}"
+        cached = get_cached_result(key)
+        if cached is not None:
+            return bool(cached)
         true_lines, false_lines = get_if_branch_lines(nid, self.nodes, self.children_of)
         true_covered = has_covered_line(self.coverage_index, norm_path, true_lines)
         if false_lines:
@@ -50,7 +61,7 @@ class IfBranchCoverageService:
             result = bool(true_covered and false_covered)
         else:
             result = bool(true_covered)
-        set_cached_result(nid, result)
+        set_cached_result(key, result)
         return result
 
 
