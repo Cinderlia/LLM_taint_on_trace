@@ -259,6 +259,9 @@ def _build_ctx_for_seq(
     seq_to_index: dict[int, int],
     scope_root: str,
     windows_root: str,
+    loc_to_records: dict | None = None,
+    idx_to_pos: dict | None = None,
+    fast_scope_expand: bool | None = None,
 ) -> dict:
     return {
         'input_seq': int(seq),
@@ -271,6 +274,9 @@ def _build_ctx_for_seq(
         'parent_of': parent_of,
         'trace_index_records': trace_index_records,
         'trace_seq_to_index': seq_to_index,
+        'loc_to_records': loc_to_records or {},
+        'idx_to_pos': idx_to_pos or {},
+        'fast_scope_expand': bool(fast_scope_expand),
         'scope_root': scope_root,
         'windows_root': windows_root,
         'llm_enabled': False,
@@ -290,6 +296,7 @@ def _collect_scope_locs(taint: dict, base_ctx: dict) -> list:
     ctx = dict(base_ctx)
     ctx['result_set'] = []
     ctx.pop('_llm_extra_prompt_locs', None)
+    fast_mode = bool(ctx.get('fast_scope_expand'))
     try:
         handler(taint, ctx)
     except Exception:
@@ -349,14 +356,15 @@ def _collect_scope_locs(taint: dict, base_ctx: dict) -> list:
         trace_index_records = ctx.get('trace_index_records') or []
         if not nodes or not trace_index_records:
             return
-        loc_to_records = _build_loc_to_records(trace_index_records)
-        idx_to_pos = {}
-        for pos, rec in enumerate(trace_index_records):
-            idx = rec.get('index')
-            try:
-                idx_to_pos[int(idx)] = int(pos)
-            except Exception:
-                continue
+        loc_to_records = ctx.get('loc_to_records') or _build_loc_to_records(trace_index_records)
+        idx_to_pos = ctx.get('idx_to_pos') or {}
+        if not idx_to_pos:
+            for pos, rec in enumerate(trace_index_records):
+                idx = rec.get('index')
+                try:
+                    idx_to_pos[int(idx)] = int(pos)
+                except Exception:
+                    continue
         ref_seq = ctx.get('input_seq')
         try:
             ref_seq_i = int(ref_seq) if ref_seq is not None else None
@@ -445,9 +453,10 @@ def _collect_scope_locs(taint: dict, base_ctx: dict) -> list:
         if extra_all:
             items.extend(extra_all)
 
-    _expand_includes(out)
-    _extend_includers(out)
-    _expand_includes(out)
+    if not fast_mode:
+        _expand_includes(out)
+        _extend_includers(out)
+        _expand_includes(out)
     return out
 
 
@@ -542,10 +551,16 @@ def _select_near_far(
 def _precompute_expand_indices(trace_index_records: list[dict], nodes: dict) -> dict:
     seq_to_index = {}
     seq_to_loc = {}
+    idx_to_pos: dict[int, int] = {}
     for rec in trace_index_records or []:
         idx = rec.get('index')
         rp = rec.get('path')
         rl = rec.get('line')
+        try:
+            if idx is not None:
+                idx_to_pos[int(idx)] = len(idx_to_pos)
+        except Exception:
+            pass
         for s in rec.get('seqs') or []:
             try:
                 si = int(s)
@@ -566,6 +581,7 @@ def _precompute_expand_indices(trace_index_records: list[dict], nodes: dict) -> 
         'loc_to_seqs': build_seqs_by_loc(trace_index_records),
         'node_to_min_seq': _build_node_to_min_seq(trace_index_records),
         'funcid_to_path': _build_funcid_to_path(trace_index_records, nodes),
+        'idx_to_pos': idx_to_pos,
     }
 
 
@@ -585,6 +601,16 @@ def _expand_one_seq(
     farthest_seq_count: int,
     indices: dict,
 ) -> tuple[int | None, list[int] | None]:
+    timing_logger = indices.get('timing_logger')
+    timing_threshold_us = indices.get('timing_threshold_us')
+    try:
+        timing_threshold_us = int(timing_threshold_us) if timing_threshold_us is not None else None
+    except Exception:
+        timing_threshold_us = None
+    timing_meta = indices.get('timing_meta') or {}
+    timing_on = timing_logger is not None and timing_threshold_us is not None
+    if timing_on:
+        _t_total_start = time.perf_counter_ns()
     try:
         seq_i = int(seq)
     except Exception:
@@ -596,21 +622,96 @@ def _expand_one_seq(
     loc_to_seqs = indices.get('loc_to_seqs') or {}
     node_to_min_seq = indices.get('node_to_min_seq') or {}
     funcid_to_path = indices.get('funcid_to_path') or {}
+    idx_to_pos = indices.get('idx_to_pos') or {}
 
     loc = seq_to_loc.get(seq_i)
     if loc is not None:
         arg = f"{loc[0]}:{int(loc[1])}"
     else:
+        if timing_on:
+            _t_read_start = time.perf_counter_ns()
         arg = read_trace_line(seq_i, trace_path)
+        if timing_on:
+            _t_read_us = int((time.perf_counter_ns() - _t_read_start) / 1000)
     if not arg:
+        if timing_on:
+            _t_total_us = int((time.perf_counter_ns() - _t_total_start) / 1000)
+            if _t_total_us >= timing_threshold_us:
+                timing_logger.info(
+                    "expand_if_slow",
+                    seq=int(seq_i),
+                    index=timing_meta.get('index'),
+                    path=timing_meta.get('path'),
+                    line=timing_meta.get('line'),
+                    total_us=_t_total_us,
+                    read_us=locals().get('_t_read_us', 0),
+                    extract_us=0,
+                    taints_us=0,
+                    ctx_us=0,
+                    extra_us=0,
+                    collect_us=0,
+                    match_us=0,
+                    taints=0,
+                    matches=0,
+                )
         return seq_i, list(rel_seqs or []) or [seq_i]
+    if timing_on:
+        _t_extract_start = time.perf_counter_ns()
     st = extract_if_elements_fast(arg, seq_i, nodes, children_of, trace_index_records, seq_to_index, parent_of, top_id_to_file)
+    if timing_on:
+        _t_extract_us = int((time.perf_counter_ns() - _t_extract_start) / 1000)
     if not (st.get('targets') or []):
+        if timing_on:
+            _t_total_us = int((time.perf_counter_ns() - _t_total_start) / 1000)
+            if _t_total_us >= timing_threshold_us:
+                timing_logger.info(
+                    "expand_if_slow",
+                    seq=int(seq_i),
+                    index=timing_meta.get('index'),
+                    path=timing_meta.get('path'),
+                    line=timing_meta.get('line'),
+                    total_us=_t_total_us,
+                    read_us=locals().get('_t_read_us', 0),
+                    extract_us=locals().get('_t_extract_us', 0),
+                    taints_us=0,
+                    ctx_us=0,
+                    extra_us=0,
+                    collect_us=0,
+                    match_us=0,
+                    taints=0,
+                    matches=0,
+                )
         return seq_i, list(rel_seqs or []) or [seq_i]
     st['seq'] = seq_i
+    if timing_on:
+        _t_taints_start = time.perf_counter_ns()
     taints = build_initial_taints(st, nodes, children_of, parent_of)
+    if timing_on:
+        _t_taints_us = int((time.perf_counter_ns() - _t_taints_start) / 1000)
     if not taints:
+        if timing_on:
+            _t_total_us = int((time.perf_counter_ns() - _t_total_start) / 1000)
+            if _t_total_us >= timing_threshold_us:
+                timing_logger.info(
+                    "expand_if_slow",
+                    seq=int(seq_i),
+                    index=timing_meta.get('index'),
+                    path=timing_meta.get('path'),
+                    line=timing_meta.get('line'),
+                    total_us=_t_total_us,
+                    read_us=locals().get('_t_read_us', 0),
+                    extract_us=locals().get('_t_extract_us', 0),
+                    taints_us=locals().get('_t_taints_us', 0),
+                    ctx_us=0,
+                    extra_us=0,
+                    collect_us=0,
+                    match_us=0,
+                    taints=0,
+                    matches=0,
+                )
         return seq_i, list(rel_seqs or []) or [seq_i]
+    if timing_on:
+        _t_ctx_start = time.perf_counter_ns()
     base_ctx = _build_ctx_for_seq(
         seq=seq_i,
         st=st,
@@ -621,9 +722,16 @@ def _expand_one_seq(
         seq_to_index=seq_to_index,
         scope_root=scope_root,
         windows_root=windows_root,
+        loc_to_records=loc_to_records,
+        idx_to_pos=idx_to_pos,
+        fast_scope_expand=bool(indices.get('fast_scope_expand')),
     )
+    if timing_on:
+        _t_ctx_us = int((time.perf_counter_ns() - _t_ctx_start) / 1000)
     seq_set = {seq_i}
     extra_scope_locs = []
+    if timing_on:
+        _t_extra_start = time.perf_counter_ns()
     for nid in st.get('targets') or []:
         try:
             nid_i = int(nid)
@@ -663,6 +771,10 @@ def _expand_one_seq(
                 loc['seq'] = int(func_seq)
             extra_scope_locs.append(loc)
             break
+    if timing_on:
+        _t_extra_us = int((time.perf_counter_ns() - _t_extra_start) / 1000)
+        _t_collect_us = 0
+        _t_match_us = 0
     for t in taints:
         tt = (t.get('type') or '').strip()
         if tt not in _ALLOWED_TYPES:
@@ -671,9 +783,15 @@ def _expand_one_seq(
         target_parts = set(_split_var_parts(tt, tn))
         if not target_parts:
             continue
+        if timing_on:
+            _t_collect_start = time.perf_counter_ns()
         scope_locs = _collect_scope_locs(t, base_ctx)
+        if timing_on:
+            _t_collect_us += int((time.perf_counter_ns() - _t_collect_start) / 1000)
         if extra_scope_locs:
             scope_locs = list(scope_locs or []) + list(extra_scope_locs)
+        if timing_on:
+            _t_match_start = time.perf_counter_ns()
         matches = _match_scope_nodes(
             target_parts=target_parts,
             scope_locs=scope_locs,
@@ -682,6 +800,8 @@ def _expand_one_seq(
             loc_to_records=loc_to_records,
             loc_to_min_seq=loc_to_min_seq,
         )
+        if timing_on:
+            _t_match_us += int((time.perf_counter_ns() - _t_match_start) / 1000)
         seq_set.update(matches)
     rest = [x for x in seq_set if x != seq_i]
     picked = _select_near_far(
@@ -690,6 +810,26 @@ def _expand_one_seq(
         near_count=nearest_seq_count,
         far_count=farthest_seq_count,
     )
+    if timing_on:
+        _t_total_us = int((time.perf_counter_ns() - _t_total_start) / 1000)
+        if _t_total_us >= timing_threshold_us:
+            timing_logger.info(
+                "expand_if_slow",
+                seq=int(seq_i),
+                index=timing_meta.get('index'),
+                path=timing_meta.get('path'),
+                line=timing_meta.get('line'),
+                total_us=_t_total_us,
+                read_us=locals().get('_t_read_us', 0),
+                extract_us=locals().get('_t_extract_us', 0),
+                taints_us=locals().get('_t_taints_us', 0),
+                ctx_us=locals().get('_t_ctx_us', 0),
+                extra_us=locals().get('_t_extra_us', 0),
+                collect_us=locals().get('_t_collect_us', 0),
+                match_us=locals().get('_t_match_us', 0),
+                taints=len(taints or []),
+                matches=len(seq_set or []),
+            )
     return seq_i, sorted({seq_i, *picked})
 
 

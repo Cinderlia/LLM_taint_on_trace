@@ -12,6 +12,7 @@ class IfBranchCoverageCache:
         self._cache: dict[str, bool] = {}
         self._cache_path = cache_path or ""
         self._loaded = False
+        self._dirty = 0
 
     def _load(self):
         if self._loaded:
@@ -46,6 +47,7 @@ class IfBranchCoverageCache:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             return
+        self._dirty = 0
 
     def get(self, key):
         self._load()
@@ -62,7 +64,9 @@ class IfBranchCoverageCache:
         except Exception:
             return
         self._cache[ks] = bool(value)
-        self._save()
+        self._dirty += 1
+        if self._dirty >= 200:
+            self._save()
 
     def reset(self):
         self._cache = {}

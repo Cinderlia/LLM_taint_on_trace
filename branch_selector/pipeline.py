@@ -558,7 +558,6 @@ async def run_pipeline(
     sections_queue: asyncio.Queue = asyncio.Queue()
     sql_sections_queue: asyncio.Queue = asyncio.Queue()
     done_sentinel = object()
-    expand_workers = max(1, int(cfg.buffer_count))
 
     async def producer():
         loop = asyncio.get_running_loop()
@@ -580,7 +579,6 @@ async def run_pipeline(
                 trace_path=trace_path,
                 if_branch_cache_path=if_branch_cache_path,
                 if_branch_cache_skip=cfg.if_branch_cache_skip,
-                expand_workers=expand_workers,
                 logger=logger,
             ):
                 asyncio.run_coroutine_threadsafe(sections_queue.put(item), loop).result()
